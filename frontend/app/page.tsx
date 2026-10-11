@@ -1,30 +1,48 @@
 
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+
+type Source = {
+  title: string;
+  url: string;
+};
 
 type Message = {
   role: "user" | "assistant";
   content: string;
+  sources?: Source[];
 };
 
 type ChatResponse = {
   reply: string;
   mode: "ai" | "demo";
+  sources?: Source[];
 };
 
-type SpeechResultEvent = {
-  results: ArrayLike<ArrayLike<{ transcript: string }>>;
+type VoiceState = "idle" | "listening" | "processing" | "speaking";
+
+type SpeechRecognitionResultLike = {
+  isFinal: boolean;
+  0: { transcript: string };
+};
+
+type SpeechRecognitionEventLike = {
+  resultIndex: number;
+  results: ArrayLike<SpeechRecognitionResultLike>;
 };
 
 type SpeechRecognitionLike = {
   lang: string;
+  continuous: boolean;
   interimResults: boolean;
-  onresult: ((event: SpeechResultEvent) => void) | null;
-  onerror: (() => void) | null;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
   onend: (() => void) | null;
+  onstart: (() => void) | null;
   start: () => void;
   stop: () => void;
+  abort: () => void;
 };
 
 type SpeechWindow = Window & {
@@ -32,363 +50,549 @@ type SpeechWindow = Window & {
   webkitSpeechRecognition?: new () => SpeechRecognitionLike;
 };
 
-const API_URL =
-  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API_URL = (
+  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+).replace(/\/+$/, "");
+
+const initialMessage: Message = {
+  role: "assistant",
+  content:
+    "Hi! I'm your AI voice assistant. You can type a message or use your microphone to talk to me.",
+};
+
+
+function getCurrentVoiceState(
+  ref: { current: VoiceState },
+): VoiceState {
+  return ref.current;
+}
 
 export default function Home() {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      role: "assistant",
-      content:
-        "Hey! I'm your personal AI assistant. Type a message or tap the microphone to talk.",
-    },
-  ]);
+  const [messages, setMessages] = useState<Message[]>([initialMessage]);
   const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [listening, setListening] = useState(false);
-  const [speaking, setSpeaking] = useState(false);
+  const [voiceState, setVoiceState] = useState<VoiceState>("idle");
   const [mode, setMode] = useState<"ai" | "demo" | null>(null);
   const [error, setError] = useState("");
+  const [autoSpeak, setAutoSpeak] = useState(true);
+  const [voiceSupported, setVoiceSupported] = useState(false);
+
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const voiceStateRef = useRef<VoiceState>("idle");
+  const messagesRef = useRef<Message[]>([initialMessage]);
+  const requestRef = useRef<AbortController | null>(null);
+  const listeningRequestedRef = useRef(false);
+  const mountedRef = useRef(false);
+  const latestReplyRef = useRef("");
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, loading]);
+  const changeVoiceState = useCallback((next: VoiceState) => {
+    voiceStateRef.current = next;
+    setVoiceState(next);
+  }, []);
 
-  useEffect(() => {
-    return () => {
+  const stopSpeaking = useCallback(() => {
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+
+    if (voiceStateRef.current === "speaking") {
+      changeVoiceState("idle");
+    }
+  }, [changeVoiceState]);
+
+  const speak = useCallback(
+    (text: string) => {
+      if (
+        !autoSpeak ||
+        typeof window === "undefined" ||
+        !("speechSynthesis" in window)
+      ) {
+        changeVoiceState("idle");
+        return;
+      }
+
+      const cleanText = text.trim();
+      if (!cleanText) {
+        changeVoiceState("idle");
+        return;
+      }
+
+      window.speechSynthesis.cancel();
+
+      const utterance = new SpeechSynthesisUtterance(cleanText);
+      utterance.lang = "en-US";
+      utterance.rate = 1;
+      utterance.pitch = 1;
+
+      utterance.onstart = () => {
+        if (mountedRef.current) changeVoiceState("speaking");
+      };
+
+      utterance.onend = () => {
+        if (mountedRef.current && voiceStateRef.current === "speaking") {
+          changeVoiceState("idle");
+        }
+      };
+
+      utterance.onerror = () => {
+        if (mountedRef.current && voiceStateRef.current === "speaking") {
+          changeVoiceState("idle");
+        }
+      };
+
+      latestReplyRef.current = cleanText;
+      window.speechSynthesis.speak(utterance);
+    },
+    [autoSpeak, changeVoiceState],
+  );
+
+  const stopListening = useCallback(() => {
+    listeningRequestedRef.current = false;
+
+    try {
       recognitionRef.current?.stop();
+    } catch {
+      // Recognition may already have stopped.
+    }
+
+    if (voiceStateRef.current === "listening") {
+      changeVoiceState("idle");
+    }
+  }, [changeVoiceState]);
+
+  const startListening = useCallback(() => {
+    if (typeof window === "undefined") return;
+
+    const SpeechRecognition =
+      (window as SpeechWindow).SpeechRecognition ||
+      (window as SpeechWindow).webkitSpeechRecognition;
+
+    if (!SpeechRecognition) {
+      setError(
+        "Speech recognition is not supported by this browser. Try the latest Chrome or Edge, or type your message instead.",
+      );
+      return;
+    }
+
+    setError("");
+
+    // Stop any current speech so the assistant does not talk over you.
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+
+    // Cancel an in-flight request when the user chooses to speak again.
+    requestRef.current?.abort();
+    requestRef.current = null;
+
+    try {
+      recognitionRef.current?.abort();
+    } catch {
+      // It may not have started yet.
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.lang = "en-US";
+    recognition.continuous = false;
+    recognition.interimResults = false;
+
+    recognition.onstart = () => {
+      if (mountedRef.current) changeVoiceState("listening");
+    };
+
+    recognition.onresult = (event) => {
+      const result = event.results[event.resultIndex];
+      if (result?.isFinal) {
+        const transcript = result[0]?.transcript?.trim();
+
+        if (transcript) {
+          setInput((current) =>
+            current.trim()
+              ? `${current.trim()} ${transcript}`
+              : transcript,
+          );
+        }
+      }
+    };
+
+    recognition.onerror = (event) => {
+      if (!mountedRef.current) return;
+
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+        setError(
+          "Microphone access was denied. Allow microphone permission in your browser settings and try again.",
+        );
+      } else if (event.error === "no-speech") {
+        setError("I didn't hear anything. Try speaking a little louder.");
+      } else if (event.error !== "aborted") {
+        setError(`Microphone error: ${event.error}. You can type instead.`);
+      }
+
+      listeningRequestedRef.current = false;
+      changeVoiceState("idle");
+    };
+
+    recognition.onend = () => {
+      recognitionRef.current = null;
+
+      if (mountedRef.current && voiceStateRef.current === "listening") {
+        changeVoiceState("idle");
+      }
+
+      listeningRequestedRef.current = false;
+    };
+
+    recognitionRef.current = recognition;
+    listeningRequestedRef.current = true;
+
+    try {
+      recognition.start();
+    } catch {
+      recognitionRef.current = null;
+      listeningRequestedRef.current = false;
+      changeVoiceState("idle");
+      setError("Could not start the microphone. Please try again.");
+    }
+  }, [changeVoiceState]);
+
+  const sendMessage = useCallback(
+    async (textOverride?: string) => {
+      const text = (textOverride ?? input).trim();
+
+      if (!text || voiceStateRef.current === "processing") return;
+
+      setError("");
+      stopListening();
+      stopSpeaking();
+
+      const nextMessages: Message[] = [
+        ...messagesRef.current,
+        { role: "user", content: text },
+      ];
+
+      messagesRef.current = nextMessages;
+      setMessages(nextMessages);
+      setInput("");
+      changeVoiceState("processing");
+
+      const controller = new AbortController();
+      requestRef.current = controller;
+
+      try {
+        const response = await fetch(`${API_URL}/api/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: nextMessages.slice(-30).map(({ role, content}) => ({
+              role, 
+              content,
+            })),
+          }),
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          let detail = `The server returned ${response.status}.`;
+
+          try {
+            const data = await response.json();
+            if (typeof data.detail === "string") detail = data.detail;
+          } catch {
+            // Keep the HTTP status message.
+          }
+
+          throw new Error(detail);
+        }
+
+        const data = (await response.json()) as ChatResponse;
+
+        if (!data.reply?.trim()) {
+          throw new Error("The assistant returned an empty response.");
+        }
+
+        const updatedMessages: Message[] = [
+         ...nextMessages,
+         {
+           role: "assistant",
+           content: data.reply.trim(),
+           sources: data.sources ?? [],
+         },
+        ];
+
+        messagesRef.current = updatedMessages;
+        setMessages(updatedMessages);
+        setMode(data.mode);
+        latestReplyRef.current = data.reply.trim();
+
+        if (mountedRef.current) {
+          speak(data.reply);
+        }
+      } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") return;
+
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Something went wrong. Please try again.",
+        );
+        changeVoiceState("idle");
+      } finally {
+        if (requestRef.current === controller) {
+          requestRef.current = null;
+          if (getCurrentVoiceState(voiceStateRef) === "processing") {
+            changeVoiceState("idle");
+          }
+        }
+      }
+    },
+    [
+      input,
+      changeVoiceState,
+      speak,
+      stopListening,
+      stopSpeaking,
+    ],
+  );
+
+  useEffect(() => {
+    mountedRef.current = true;
+
+    const browserWindow = window as SpeechWindow;
+    setVoiceSupported(
+      Boolean(
+        browserWindow.SpeechRecognition ||
+          browserWindow.webkitSpeechRecognition,
+      ),
+    );
+
+    return () => {
+      mountedRef.current = false;
+      listeningRequestedRef.current = false;
+      requestRef.current?.abort();
+      recognitionRef.current?.abort();
+
       if ("speechSynthesis" in window) {
         window.speechSynthesis.cancel();
       }
     };
   }, []);
 
-  function speak(text: string) {
-    if (!("speechSynthesis" in window)) {
-      setError("Speech playback is not supported in this browser.");
-      return;
+  const handleMicrophoneClick = () => {
+    if (voiceState === "listening") {
+      stopListening();
+    } else {
+      startListening();
     }
+  };
 
-    window.speechSynthesis.cancel();
+  const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    void sendMessage();
+  };
 
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "en-US";
-    utterance.rate = 1;
-    utterance.onstart = () => setSpeaking(true);
-    utterance.onend = () => setSpeaking(false);
-    utterance.onerror = () => setSpeaking(false);
-
-    window.speechSynthesis.speak(utterance);
-  }
-
-  async function sendMessage(
-    event?: FormEvent<HTMLFormElement>,
-    override?: string,
-  ) {
-    event?.preventDefault();
-
-    const content = (override ?? input).trim();
-
-    if (!content || loading) return;
-
-    const userMessage: Message = { role: "user", content };
-    const nextMessages = [...messages, userMessage];
-
-    setMessages(nextMessages);
-    setInput("");
-    setError("");
-    setLoading(true);
-
-    try {
-      const response = await fetch(`${API_URL}/api/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: nextMessages.slice(-20),
-        }),
-      });
-
-      const data = (await response.json()) as ChatResponse & {
-        detail?: string;
-      };
-
-      if (!response.ok) {
-        throw new Error(data.detail ?? "Unable to get a response.");
-      }
-
-      const assistantMessage: Message = {
-        role: "assistant",
-        content: data.reply,
-      };
-
-      setMessages((current) => [...current, assistantMessage]);
-      setMode(data.mode);
-      speak(data.reply);
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Could not connect to the backend.",
-      );
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function startListening() {
-    const speechWindow = window as SpeechWindow;
-    const Recognition =
-      speechWindow.SpeechRecognition ??
-      speechWindow.webkitSpeechRecognition;
-
-    if (!Recognition) {
-      setError(
-        "Speech recognition is not supported here. Try a recent version of Chrome or Edge.",
-      );
-      return;
-    }
-
-    setError("");
-
-    const recognition = new Recognition();
-    recognition.lang = "en-US";
-    recognition.interimResults = false;
-    recognitionRef.current = recognition;
-
-    recognition.onresult = (event) => {
-      const transcript = Array.from(event.results)
-        .map((result) => result[0].transcript)
-        .join(" ")
-        .trim();
-
-      setListening(false);
-
-      if (transcript) {
-        void sendMessage(undefined, transcript);
-      }
-    };
-
-    recognition.onerror = () => {
-      setListening(false);
-      setError("Microphone recognition failed. Check browser permissions.");
-    };
-
-    recognition.onend = () => setListening(false);
-
-    try {
-      recognition.start();
-      setListening(true);
-    } catch {
-      setListening(false);
-      setError("Could not start the microphone. Try again.");
-    }
-  }
-
-  function stopListening() {
-    recognitionRef.current?.stop();
-    setListening(false);
-  }
-
-  function stopSpeaking() {
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-    }
-    setSpeaking(false);
-  }
+  const statusText: Record<VoiceState, string> = {
+    idle: "Ready when you are",
+    listening: "Listening — speak now",
+    processing: "Thinking...",
+    speaking: "Speaking — you can interrupt",
+  };
 
   return (
     <main className="app-shell">
       <aside className="sidebar">
-        <a className="brand" href="/">
-          <span className="brand-icon">✳</span>
-          <span>my<span className="accent">voice</span>.ai</span>
-        </a>
-
-        <button
-          className="new-chat"
-          onClick={() => {
-            setMessages([
-              {
-                role: "assistant",
-                content: "New conversation started. What is on your mind?",
-              },
-            ]);
-            setMode(null);
-            setError("");
-          }}
-        >
-          <span>＋</span> New conversation
-        </button>
-
-        <div className="sidebar-label">YOUR ASSISTANT</div>
-        <div className="assistant-card">
-          <span className="assistant-avatar">✳</span>
-          <div>
-            <strong>Personal AI</strong>
-            <p>Voice & text assistant</p>
-          </div>
-          <span className="online-dot" />
+        <div>
+          <div className="brand-mark">✳</div>
+          <h1>My AI Voice</h1>
+          <p className="sidebar-subtitle">Your personal AI assistant</p>
         </div>
 
-        <div className="sidebar-bottom">
-          <span className="status-dot" />
-          Local development
-          <p>Built by you, for you.</p>
+        <div className="sidebar-status">
+          <span
+            className={`status-dot status-${voiceState}`}
+            aria-hidden="true"
+          />
+          <span>{statusText[voiceState]}</span>
+        </div>
+
+        <div className="sidebar-settings">
+          <label className="setting-row">
+            <span>Speak replies aloud</span>
+            <input
+              type="checkbox"
+              checked={autoSpeak}
+              onChange={(event) => {
+                const enabled = event.target.checked;
+                setAutoSpeak(enabled);
+
+                if (!enabled) stopSpeaking();
+              }}
+            />
+          </label>
+
+          <p className="sidebar-hint">
+            {voiceSupported
+              ? "Browser voice input is available."
+              : "Voice input needs Chrome or Edge. Text chat is still available."}
+          </p>
+        </div>
+
+        <div className="sidebar-footer">
+          <span>{mode === "ai" ? "Gemini AI connected" : "AI assistant"}</span>
         </div>
       </aside>
 
       <section className="workspace">
-        <header className="topbar">
+        <header className="workspace-header">
           <div>
-            <span className="mobile-brand">✳ myvoice.ai</span>
-            <span className="connection-label">
-              <span className="status-dot" />
-              {mode === "ai"
-                ? "AI connected"
-                : mode === "demo"
-                  ? "Demo mode"
-                  : "Ready to connect"}
-            </span>
+            <p className="eyebrow">PERSONAL ASSISTANT</p>
+            <h2>Conversation</h2>
           </div>
-          <span className="model-label">PERSONAL ASSISTANT</span>
+
+          <button
+            type="button"
+            className="stop-button"
+            onClick={stopSpeaking}
+            disabled={voiceState !== "speaking"}
+          >
+            Stop voice
+          </button>
         </header>
 
-        <div className="conversation">
-          {messages.length === 1 && (
-            <section className="welcome">
-              <div className="welcome-orb">
-                <div className="orb-inner">✳</div>
-              </div>
-              <p className="eyebrow">YOUR SPACE. YOUR AI.</p>
-              <h1>
-                A little less typing.
-                <br />
-                <span>A little more talking.</span>
-              </h1>
-              <p className="welcome-description">
-                Ask a question, explore an idea, or just start a conversation.
-                Your personal assistant is ready.
-              </p>
-
-              <div className="suggestions">
-                {[
-                  "Give me a daily motivation",
-                  "Explain how AI works",
-                  "Help me plan my day",
-                ].map((suggestion) => (
-                  <button
-                    key={suggestion}
-                    onClick={() => void sendMessage(undefined, suggestion)}
-                    disabled={loading}
-                  >
-                    {suggestion} <span>↗</span>
-                  </button>
-                ))}
-              </div>
-            </section>
-          )}
-
+        <section
+          className="conversation"
+          aria-label="Chat conversation"
+          aria-live="polite"
+        >
           <div className="message-list">
-            {messages.slice(1).map((message, index) => (
+            {messages.map((message, index) => (
               <article
                 key={`${index}-${message.role}`}
                 className={`message-row ${message.role}`}
               >
                 <div className="message-avatar">
-                  {message.role === "user" ? "Y" : "✳"}
+                  {message.role === "assistant" ? "✳" : "You"}
                 </div>
+
                 <div className="message-content">
-                  <span className="message-author">
-                    {message.role === "user" ? "You" : "My AI"}
-                  </span>
-                  <p>{message.content}</p>
-                  {message.role === "assistant" && (
-                    <button
-                      className="small-action"
-                      onClick={() => speak(message.content)}
-                      aria-label="Play assistant response"
-                    >
-                      ▶ Listen
-                    </button>
-                  )}
+                  <p className="message-author">
+                    {message.role === "assistant" ? "Assistant" : "You"}
+                  </p>
+                  <div className="message-bubble">
+                    <p>{message.content}</p>
+                  </div>
+
+                  
+                {message.role === "assistant" &&
+                   message.sources &&
+                   message.sources.length > 0 && (
+                     <div className="sources-list">
+                       <p className="sources-heading">Web sources</p>
+                       <ul>
+                         {message.sources.map((source) => (
+                           <li key={source.url}>
+                             <a
+                               href={source.url}
+                               target="_blank"
+                               rel="noopener noreferrer"
+                             >
+                               {source.title}
+                             </a>
+                           </li>
+                         ))}
+                       </ul>
+                      </div>
+                    )}
+
                 </div>
               </article>
             ))}
 
-            {loading && (
-              <div className="thinking">
-                <span className="message-avatar">✳</span>
+            {voiceState === "processing" && (
+              <div className="thinking" role="status">
                 <span className="thinking-dots">
-                  <i />
-                  <i />
-                  <i />
+                  <span />
+                  <span />
+                  <span />
                 </span>
-                <span>Thinking...</span>
+                <span>Thinking of a response...</span>
               </div>
             )}
-            <div ref={bottomRef} />
           </div>
-        </div>
+        </section>
+
+        {error && (
+          <div className="error-message" role="alert">
+            <span>{error}</span>
+            <button type="button" onClick={() => setError("")} aria-label="Dismiss error">
+              ×
+            </button>
+          </div>
+        )}
 
         <div className="composer-area">
-          {error && <p className="error-message">{error}</p>}
+          {voiceState === "listening" && (
+            <div className="listening-indicator" role="status">
+              <span className="listening-pulse" />
+              Listening to your voice
+            </div>
+          )}
 
-          <form className="composer" onSubmit={(event) => void sendMessage(event)}>
-            <textarea
+          {voiceState === "speaking" && (
+            <div className="speaking-indicator" role="status">
+              <span className="sound-wave" aria-hidden="true">
+                <i />
+                <i />
+                <i />
+                <i />
+                <i />
+              </span>
+              Assistant is speaking. Tap the microphone to interrupt.
+            </div>
+          )}
+
+          <form className="composer" onSubmit={handleSubmit}>
+            <button
+              type="button"
+              className={`mic-button ${voiceState === "listening" ? "active" : ""}`}
+              onClick={handleMicrophoneClick}
+              disabled={voiceState === "processing"}
+              aria-label={
+                voiceState === "listening"
+                  ? "Stop listening"
+                  : "Start voice input"
+              }
+              title={
+                voiceState === "listening"
+                  ? "Stop listening"
+                  : "Start voice input"
+              }
+            >
+              {voiceState === "listening" ? "■" : "🎙"}
+            </button>
+
+            <input
               value={input}
               onChange={(event) => setInput(event.target.value)}
-              placeholder="Ask me anything..."
-              rows={1}
-              maxLength={4000}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  void sendMessage();
-                }
-              }}
+              placeholder={
+                voiceState === "listening"
+                  ? "Speak now, or type here..."
+                  : "Ask me anything..."
+              }
               aria-label="Your message"
+              maxLength={4000}
+              disabled={voiceState === "processing"}
             />
 
-            <div className="composer-actions">
-              <span className="composer-hint">
-                {listening ? "Listening to you..." : "Enter to send"}
-              </span>
-
-              {speaking && (
-                <button
-                  type="button"
-                  className="icon-button stop-button"
-                  onClick={stopSpeaking}
-                  title="Stop voice playback"
-                >
-                  ■
-                </button>
-              )}
-
-              <button
-                type="button"
-                className={`icon-button mic-button ${listening ? "listening" : ""}`}
-                onClick={listening ? stopListening : startListening}
-                title={listening ? "Stop listening" : "Start voice input"}
-                aria-label={listening ? "Stop listening" : "Start voice input"}
-              >
-                {listening ? "■" : "🎙"}
-              </button>
-
-              <button
-                type="submit"
-                className="send-button"
-                disabled={loading || !input.trim()}
-                aria-label="Send message"
-              >
-                ↑
-              </button>
-            </div>
+            <button
+              type="submit"
+              className="send-button"
+              disabled={!input.trim() || voiceState === "processing"}
+            >
+              Send <span aria-hidden="true">↑</span>
+            </button>
           </form>
-          <p className="disclaimer">
-            Your personal AI. Responses may be inaccurate.
+
+          <p className="composer-note">
+            AI can make mistakes. Check important information.
           </p>
         </div>
       </section>
