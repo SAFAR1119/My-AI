@@ -1,15 +1,18 @@
 
 import logging
 import os
+from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 from pydantic import BaseModel, Field
 
 load_dotenv()
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -19,7 +22,7 @@ FRONTEND_ORIGIN = os.getenv(
     "http://localhost:3000",
 )
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 client = (
     genai.Client(api_key=GEMINI_API_KEY)
@@ -29,8 +32,8 @@ client = (
 
 app = FastAPI(
     title=APP_NAME,
-    version="0.2.0",
-    description="Personal AI voice and text assistant API.",
+    version="0.3.0",
+    description="Personal AI voice and text assistant with web search.",
 )
 
 app.add_middleware(
@@ -51,9 +54,78 @@ class ChatRequest(BaseModel):
     messages: list[Message] = Field(min_length=1, max_length=30)
 
 
+class Source(BaseModel):
+    title: str
+    url: str
+
+
 class ChatResponse(BaseModel):
     reply: str
     mode: str
+    sources: list[Source] = Field(default_factory=list)
+
+
+def read_field(obj: Any, name: str) -> Any:
+    """Read a field from either a dictionary or an SDK object."""
+    if isinstance(obj, dict):
+        return obj.get(name)
+
+    return getattr(obj, name, None)
+
+
+def extract_sources(response: Any) -> list[Source]:
+    """Extract unique web sources returned by Google Search grounding."""
+    sources: list[Source] = []
+    seen_urls: set[str] = set()
+
+    candidates = read_field(response, "candidates") or []
+
+    for candidate in candidates:
+        metadata = read_field(candidate, "grounding_metadata")
+
+        if metadata is None:
+            metadata = read_field(candidate, "groundingMetadata")
+
+        if metadata is None:
+            continue
+
+        chunks = read_field(metadata, "grounding_chunks")
+
+        if chunks is None:
+            chunks = read_field(metadata, "groundingChunks")
+
+        for chunk in chunks or []:
+            web = read_field(chunk, "web")
+
+            if web is None:
+                continue
+
+            url = read_field(web, "uri") or read_field(web, "url")
+            title = read_field(web, "title")
+
+            if not isinstance(url, str):
+                continue
+
+            parsed_url = urlparse(url)
+
+            if parsed_url.scheme != "https" or not parsed_url.netloc:
+                continue
+
+            if url in seen_urls:
+                continue
+
+            seen_urls.add(url)
+            sources.append(
+                Source(
+                    title=title.strip() if isinstance(title, str) and title.strip() else parsed_url.netloc,
+                    url=url,
+                )
+            )
+
+            if len(sources) >= 8:
+                return sources
+
+    return sources
 
 
 @app.get("/")
@@ -72,6 +144,7 @@ async def health():
         "ai_configured": client is not None,
         "provider": "Gemini" if client else None,
         "model": GEMINI_MODEL if client else None,
+        "web_search_enabled": client is not None,
     }
 
 
@@ -79,7 +152,10 @@ async def health():
 async def chat(request: ChatRequest):
     allowed_roles = {"user", "assistant"}
 
-    if any(message.role not in allowed_roles for message in request.messages):
+    if any(
+        message.role not in allowed_roles
+        for message in request.messages
+    ):
         raise HTTPException(
             status_code=422,
             detail="Messages may only have user or assistant roles.",
@@ -94,8 +170,8 @@ async def chat(request: ChatRequest):
     if client is None:
         return ChatResponse(
             reply=(
-                "I'm running in demo mode. Add a Gemini API key to enable "
-                "real AI responses. Your backend is working correctly."
+                "I'm running in demo mode. Add a Gemini API key "
+                "to enable real AI responses."
             ),
             mode="demo",
         )
@@ -116,8 +192,19 @@ async def chat(request: ChatRequest):
                 system_instruction=(
                     "You are a friendly personal AI voice assistant. "
                     "Answer naturally, accurately, and clearly. "
-                    "Prefer concise responses that sound good aloud."
+                    "Prefer concise responses that sound good aloud. "
+                    "For recent events, current information, prices, "
+                    "or facts that may have changed, use Google Search "
+                    "when it will help you answer accurately. "
+                    "Do not claim to have searched the web unless you "
+                    "actually used search results. Be transparent when "
+                    "current information cannot be verified."
                 ),
+                tools=[
+                    types.Tool(
+                        google_search=types.GoogleSearch()
+                    )
+                ],
             ),
         )
 
@@ -129,16 +216,68 @@ async def chat(request: ChatRequest):
                 detail="The AI provider returned an empty response.",
             )
 
-        return ChatResponse(reply=reply, mode="ai")
+        sources = extract_sources(response)
+
+        logger.info(
+            "Gemini response received; extracted %d source(s).",
+            len(sources),
+        )
+
+        return ChatResponse(
+            reply=reply,
+            mode="ai",
+            sources=sources,
+        )
 
     except HTTPException:
         raise
-    except Exception as exc:
-        logger.exception("Gemini request failed")
+
+    except errors.APIError as exc:
+        logger.warning(
+            "Gemini API error: code=%s, message=%s",
+            exc.code,
+            exc.message,
+        )
+
+        if exc.code == 503:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Gemini is temporarily overloaded. "
+                    "Wait 10–30 seconds and try again."
+                ),
+            ) from exc
+
+        if exc.code == 429:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Gemini has reached a usage limit. "
+                    "Check your API quota and try again later."
+                ),
+            ) from exc
+
+        if exc.code == 404:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "The configured Gemini model or requested capability "
+                    "is unavailable. Check the model and API access."
+                ),
+            ) from exc
+
         raise HTTPException(
             status_code=502,
             detail=(
-                "The AI request failed. Check your API key, model access, "
-                "usage limits, and backend terminal for details."
+                f"Gemini returned API error {exc.code}. "
+                "Check the backend terminal for details."
             ),
+        ) from exc
+
+    except Exception as exc:
+        logger.exception("Unexpected Gemini request failure")
+
+        raise HTTPException(
+            status_code=502,
+            detail="An unexpected error occurred while contacting Gemini.",
         ) from exc
