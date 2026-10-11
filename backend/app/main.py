@@ -1,9 +1,11 @@
 
 import logging
 import os
+import asyncio
 from typing import Any
 from urllib.parse import urlparse
 
+from fastapi import WebSocket, WebSocketDisconnect
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -281,3 +283,168 @@ async def chat(request: ChatRequest):
             status_code=502,
             detail="An unexpected error occurred while contacting Gemini.",
         ) from exc
+
+
+@app.websocket("/api/live")
+async def live_voice(websocket: WebSocket):
+    await websocket.accept()
+
+    if client is None:
+        await websocket.send_json({
+            "type": "error",
+            "message": "Gemini API key is not configured.",
+        })
+        await websocket.close(code=1011)
+        return
+
+    live_model = os.getenv(
+        "GEMINI_LIVE_MODEL",
+        "gemini-3.8-live",
+    ).strip()
+
+    try:
+        config = {
+            "response_modalities": ["AUDIO"],
+            "input_audio_transcription": {},
+            "output_audio_transcription": {},
+            "speech_config": {
+                "voice_config": {
+                    "prebuilt_voice_config": {
+                        "voice_name": "Kore",
+                    }
+                }
+            },
+            "system_instruction": (
+                "You are a friendly, helpful personal AI voice assistant. "
+                "Speak naturally and conversationally. Keep answers clear "
+                "and reasonably concise. Listen to the user and respond "
+                "to the meaning of what they say."
+            ),
+        }
+
+        async with client.aio.live.connect(
+            model=live_model,
+            config=config,
+        ) as session:
+            await websocket.send_json({
+                "type": "ready",
+                "model": live_model,
+                "message": "Live voice connected.",
+            })
+
+            async def send_microphone_audio():
+                while True:
+                    packet = await websocket.receive()
+
+                    if packet["type"] == "websocket.disconnect":
+                        return
+
+                    audio_data = packet.get("bytes")
+
+                    if audio_data:
+                        await session.send_realtime_input(
+                            audio=types.Blob(
+                                data=audio_data,
+                                mime_type="audio/pcm;rate=16000",
+                            )
+                        )
+
+            async def receive_gemini_responses():
+                async for response in session.receive():
+                    content = response.server_content
+
+                    if content is None:
+                        continue
+
+                    if content.interrupted:
+                        await websocket.send_json({
+                            "type": "interrupted",
+                        })
+
+                    if content.input_transcription:
+                        text = content.input_transcription.text or ""
+
+                        if text:
+                            await websocket.send_json({
+                                "type": "input_transcription",
+                                "text": text,
+                            })
+
+                    if content.output_transcription:
+                        text = content.output_transcription.text or ""
+
+                        if text:
+                            await websocket.send_json({
+                                "type": "output_transcription",
+                                "text": text,
+                            })
+
+                    if content.model_turn:
+                        for part in content.model_turn.parts:
+                            inline_data = part.inline_data
+
+                            if inline_data and inline_data.data:
+                                await websocket.send_bytes(
+                                    inline_data.data
+                                )
+
+                    if content.turn_complete:
+                        await websocket.send_json({
+                            "type": "turn_complete",
+                        })
+
+            mic_task = asyncio.create_task(
+                send_microphone_audio()
+            )
+            response_task = asyncio.create_task(
+                receive_gemini_responses()
+            )
+
+            tasks = {mic_task, response_task}
+
+            try:
+                _, pending = await asyncio.wait(
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                for task in pending:
+                    task.cancel()
+
+                await asyncio.gather(
+                    *tasks,
+                    return_exceptions=True,
+                )
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+
+                await asyncio.gather(
+                    *tasks,
+                    return_exceptions=True,
+                )
+
+    except WebSocketDisconnect:
+        logger.info("Live voice client disconnected.")
+
+    except Exception:
+        logger.exception("Live voice session failed.")
+
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": (
+                    "The live voice session failed. Check the backend "
+                    "terminal for the Gemini error and model access."
+                ),
+            })
+        except Exception:
+            pass
+
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
