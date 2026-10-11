@@ -1,32 +1,36 @@
 
+import logging
 import os
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from openai import AsyncOpenAI, APIError
+from google import genai
+from google.genai import types
 from pydantic import BaseModel, Field
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 APP_NAME = os.getenv("APP_NAME", "My AI Voice")
 FRONTEND_ORIGIN = os.getenv(
     "FRONTEND_ORIGIN",
     "http://localhost:3000",
 )
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 client = (
-    AsyncOpenAI(api_key=OPENAI_API_KEY)
-    if OPENAI_API_KEY
+    genai.Client(api_key=GEMINI_API_KEY)
+    if GEMINI_API_KEY
     else None
 )
 
 app = FastAPI(
     title=APP_NAME,
-    version="0.1.0",
-    description="Backend for a personal AI voice assistant.",
+    version="0.2.0",
+    description="Personal AI voice and text assistant API.",
 )
 
 app.add_middleware(
@@ -66,7 +70,8 @@ async def health():
     return {
         "status": "ok",
         "ai_configured": client is not None,
-        "model": OPENAI_MODEL if client else None,
+        "provider": "Gemini" if client else None,
+        "model": GEMINI_MODEL if client else None,
     }
 
 
@@ -89,46 +94,51 @@ async def chat(request: ChatRequest):
     if client is None:
         return ChatResponse(
             reply=(
-                "I'm running in demo mode, so I can't generate a real "
-                "AI response yet. Your chat interface and backend are "
-                "connected successfully. Add an API key to enable the "
-                "AI brain."
+                "I'm running in demo mode. Add a Gemini API key to enable "
+                "real AI responses. Your backend is working correctly."
             ),
             mode="demo",
         )
 
+    contents = [
+        {
+            "role": "model" if message.role == "assistant" else "user",
+            "parts": [{"text": message.content}],
+        }
+        for message in request.messages
+    ]
+
     try:
-        response = await client.responses.create(
-            model=OPENAI_MODEL,
-            instructions=(
-                "You are a friendly personal AI voice assistant. "
-                "Answer naturally and clearly. Prefer concise responses "
-                "that sound good when spoken aloud."
+        response = await client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "You are a friendly personal AI voice assistant. "
+                    "Answer naturally, accurately, and clearly. "
+                    "Prefer concise responses that sound good aloud."
+                ),
             ),
-            input=[
-                {
-                    "role": message.role,
-                    "content": message.content,
-                }
-                for message in request.messages
-            ],
         )
 
-        reply = response.output_text.strip()
+        reply = (response.text or "").strip()
 
         if not reply:
             raise HTTPException(
                 status_code=502,
-                detail="The AI returned an empty response.",
+                detail="The AI provider returned an empty response.",
             )
 
         return ChatResponse(reply=reply, mode="ai")
 
     except HTTPException:
         raise
-    except APIError as exc:
+    except Exception as exc:
+        logger.exception("Gemini request failed")
         raise HTTPException(
             status_code=502,
-            detail="The AI provider request failed. Check API access, "
-            "billing, model availability, and backend logs.",
+            detail=(
+                "The AI request failed. Check your API key, model access, "
+                "usage limits, and backend terminal for details."
+            ),
         ) from exc
