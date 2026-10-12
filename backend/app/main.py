@@ -1,13 +1,12 @@
 
+import asyncio
 import logging
 import os
-import asyncio
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import WebSocket, WebSocketDisconnect
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import errors, types
@@ -25,6 +24,10 @@ FRONTEND_ORIGIN = os.getenv(
 )
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_LIVE_MODEL = os.getenv(
+    "GEMINI_LIVE_MODEL",
+    "gemini-3.8-live",
+).strip()
 
 client = (
     genai.Client(api_key=GEMINI_API_KEY)
@@ -34,8 +37,8 @@ client = (
 
 app = FastAPI(
     title=APP_NAME,
-    version="0.3.0",
-    description="Personal AI voice and text assistant with web search.",
+    version="0.4.0",
+    description="Personal AI assistant with text, web search, and live voice.",
 )
 
 app.add_middleware(
@@ -68,7 +71,6 @@ class ChatResponse(BaseModel):
 
 
 def read_field(obj: Any, name: str) -> Any:
-    """Read a field from either a dictionary or an SDK object."""
     if isinstance(obj, dict):
         return obj.get(name)
 
@@ -76,13 +78,10 @@ def read_field(obj: Any, name: str) -> Any:
 
 
 def extract_sources(response: Any) -> list[Source]:
-    """Extract unique web sources returned by Google Search grounding."""
     sources: list[Source] = []
     seen_urls: set[str] = set()
 
-    candidates = read_field(response, "candidates") or []
-
-    for candidate in candidates:
+    for candidate in read_field(response, "candidates") or []:
         metadata = read_field(candidate, "grounding_metadata")
 
         if metadata is None:
@@ -117,9 +116,14 @@ def extract_sources(response: Any) -> list[Source]:
                 continue
 
             seen_urls.add(url)
+
             sources.append(
                 Source(
-                    title=title.strip() if isinstance(title, str) and title.strip() else parsed_url.netloc,
+                    title=(
+                        title.strip()
+                        if isinstance(title, str) and title.strip()
+                        else parsed_url.netloc
+                    ),
                     url=url,
                 )
             )
@@ -146,6 +150,7 @@ async def health():
         "ai_configured": client is not None,
         "provider": "Gemini" if client else None,
         "model": GEMINI_MODEL if client else None,
+        "live_model": GEMINI_LIVE_MODEL if client else None,
         "web_search_enabled": client is not None,
     }
 
@@ -154,10 +159,7 @@ async def health():
 async def chat(request: ChatRequest):
     allowed_roles = {"user", "assistant"}
 
-    if any(
-        message.role not in allowed_roles
-        for message in request.messages
-    ):
+    if any(message.role not in allowed_roles for message in request.messages):
         raise HTTPException(
             status_code=422,
             detail="Messages may only have user or assistant roles.",
@@ -192,15 +194,13 @@ async def chat(request: ChatRequest):
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=(
-                    "You are a friendly personal AI voice assistant. "
+                    "You are a friendly personal AI assistant. "
                     "Answer naturally, accurately, and clearly. "
                     "Prefer concise responses that sound good aloud. "
                     "For recent events, current information, prices, "
                     "or facts that may have changed, use Google Search "
-                    "when it will help you answer accurately. "
-                    "Do not claim to have searched the web unless you "
-                    "actually used search results. Be transparent when "
-                    "current information cannot be verified."
+                    "when it helps answer accurately. Do not claim to "
+                    "have searched unless search was actually used."
                 ),
                 tools=[
                     types.Tool(
@@ -221,7 +221,7 @@ async def chat(request: ChatRequest):
         sources = extract_sources(response)
 
         logger.info(
-            "Gemini response received; extracted %d source(s).",
+            "Text response generated with %d source(s).",
             len(sources),
         )
 
@@ -236,7 +236,7 @@ async def chat(request: ChatRequest):
 
     except errors.APIError as exc:
         logger.warning(
-            "Gemini API error: code=%s, message=%s",
+            "Gemini text API error: code=%s, message=%s",
             exc.code,
             exc.message,
         )
@@ -246,7 +246,7 @@ async def chat(request: ChatRequest):
                 status_code=503,
                 detail=(
                     "Gemini is temporarily overloaded. "
-                    "Wait 10–30 seconds and try again."
+                    "Wait briefly and try again."
                 ),
             ) from exc
 
@@ -259,26 +259,13 @@ async def chat(request: ChatRequest):
                 ),
             ) from exc
 
-        if exc.code == 404:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "The configured Gemini model or requested capability "
-                    "is unavailable. Check the model and API access."
-                ),
-            ) from exc
-
         raise HTTPException(
             status_code=502,
-            detail=(
-                f"Gemini returned API error {exc.code}. "
-                "Check the backend terminal for details."
-            ),
+            detail=f"Gemini returned API error {exc.code}.",
         ) from exc
 
     except Exception as exc:
-        logger.exception("Unexpected Gemini request failure")
-
+        logger.exception("Unexpected text chat failure")
         raise HTTPException(
             status_code=502,
             detail="An unexpected error occurred while contacting Gemini.",
@@ -297,16 +284,14 @@ async def live_voice(websocket: WebSocket):
         await websocket.close(code=1011)
         return
 
-    live_model = os.getenv(
-        "GEMINI_LIVE_MODEL",
-        "gemini-3.8-live",
-    ).strip()
-
     try:
         config = {
             "response_modalities": ["AUDIO"],
             "input_audio_transcription": {},
             "output_audio_transcription": {},
+            "tools": [
+                {"google_search": {}},
+            ],
             "speech_config": {
                 "voice_config": {
                     "prebuilt_voice_config": {
@@ -315,20 +300,24 @@ async def live_voice(websocket: WebSocket):
                 }
             },
             "system_instruction": (
-                "You are a friendly, helpful personal AI voice assistant. "
-                "Speak naturally and conversationally. Keep answers clear "
-                "and reasonably concise. Listen to the user and respond "
-                "to the meaning of what they say."
+                "You are a helpful, friendly personal AI voice assistant. "
+                "Speak naturally and conversationally. Keep responses clear "
+                "and reasonably concise. Listen to the user's request and "
+                "answer what they actually asked. For current events, "
+                "recent information, or facts that may have changed, use "
+                "Google Search when useful. Be transparent if you cannot "
+                "verify something. Do not claim to have searched unless "
+                "you actually used search."
             ),
         }
 
         async with client.aio.live.connect(
-            model=live_model,
+            model=GEMINI_LIVE_MODEL,
             config=config,
         ) as session:
             await websocket.send_json({
                 "type": "ready",
-                "model": live_model,
+                "model": GEMINI_LIVE_MODEL,
                 "message": "Live voice connected.",
             })
 
@@ -350,60 +339,61 @@ async def live_voice(websocket: WebSocket):
                         )
 
             async def receive_gemini_responses():
-                async for response in session.receive():
-                    content = response.server_content
+                # The SDK's receive() iterator completes at the end
+                # of an interaction. Re-enter it for later turns
+                # without closing the persistent Live session.
+                while True:
+                    async for response in session.receive():
+                        content = response.server_content
 
-                    if content is None:
-                        continue
+                        if content is None:
+                            continue
 
-                    if content.interrupted:
-                        await websocket.send_json({
-                            "type": "interrupted",
-                        })
-
-                    if content.input_transcription:
-                        text = content.input_transcription.text or ""
-
-                        if text:
+                        if content.interrupted:
                             await websocket.send_json({
-                                "type": "input_transcription",
-                                "text": text,
+                                "type": "interrupted",
                             })
 
-                    if content.output_transcription:
-                        text = content.output_transcription.text or ""
+                        if content.input_transcription:
+                            text = content.input_transcription.text or ""
 
-                        if text:
+                            if text:
+                                await websocket.send_json({
+                                    "type": "input_transcription",
+                                    "text": text,
+                                })
+
+                        if content.output_transcription:
+                            text = content.output_transcription.text or ""
+
+                            if text:
+                                await websocket.send_json({
+                                    "type": "output_transcription",
+                                    "text": text,
+                                })
+
+                        if content.model_turn:
+                            for part in content.model_turn.parts:
+                                inline_data = part.inline_data
+
+                                if inline_data and inline_data.data:
+                                    await websocket.send_bytes(
+                                        inline_data.data
+                                    )
+
+                        if content.turn_complete:
                             await websocket.send_json({
-                                "type": "output_transcription",
-                                "text": text,
+                                "type": "turn_complete",
                             })
 
-                    if content.model_turn:
-                        for part in content.model_turn.parts:
-                            inline_data = part.inline_data
-
-                            if inline_data and inline_data.data:
-                                await websocket.send_bytes(
-                                    inline_data.data
-                                )
-
-                    if content.turn_complete:
-                        await websocket.send_json({
-                            "type": "turn_complete",
-                        })
-
-            mic_task = asyncio.create_task(
-                send_microphone_audio()
-            )
+            mic_task = asyncio.create_task(send_microphone_audio())
             response_task = asyncio.create_task(
                 receive_gemini_responses()
             )
-
             tasks = {mic_task, response_task}
 
             try:
-                _, pending = await asyncio.wait(
+                done, pending = await asyncio.wait(
                     tasks,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -412,9 +402,19 @@ async def live_voice(websocket: WebSocket):
                     task.cancel()
 
                 await asyncio.gather(
-                    *tasks,
+                    *pending,
                     return_exceptions=True,
                 )
+
+                for task in done:
+                    if task.cancelled():
+                        continue
+
+                    task_error = task.exception()
+
+                    if task_error is not None:
+                        raise task_error
+
             finally:
                 for task in tasks:
                     if not task.done():
@@ -428,6 +428,24 @@ async def live_voice(websocket: WebSocket):
     except WebSocketDisconnect:
         logger.info("Live voice client disconnected.")
 
+    except errors.APIError as exc:
+        logger.warning(
+            "Gemini Live API error: code=%s, message=%s",
+            exc.code,
+            exc.message,
+        )
+
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": (
+                    f"Gemini Live returned error {exc.code}. "
+                    "Check the model, API access, and usage limits."
+                ),
+            })
+        except Exception:
+            pass
+
     except Exception:
         logger.exception("Live voice session failed.")
 
@@ -435,8 +453,8 @@ async def live_voice(websocket: WebSocket):
             await websocket.send_json({
                 "type": "error",
                 "message": (
-                    "The live voice session failed. Check the backend "
-                    "terminal for the Gemini error and model access."
+                    "The live session failed. Check the backend terminal "
+                    "for details."
                 ),
             })
         except Exception:
@@ -447,4 +465,3 @@ async def live_voice(websocket: WebSocket):
             await websocket.close()
         except Exception:
             pass
-
