@@ -57,7 +57,7 @@ const API_URL = (
 const initialMessage: Message = {
   role: "assistant",
   content:
-    "Hi! I'm your AI voice assistant. You can type a message or use your microphone to talk to me.",
+    "Hi! I'm My AI Voice, developed by Safar Ahmed and powered by Gemini. You can type a message or use your microphone to talk to me.",
 };
 
 

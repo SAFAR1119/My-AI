@@ -21,43 +21,9 @@ const API_URL = (
 
 const LIVE_URL = `${API_URL.replace(/^http/, "ws")}/api/live`;
 
-function convertToPcm16(
-  samples: Float32Array,
-  sampleRate: number,
-): ArrayBuffer {
-  const ratio = sampleRate / 16000;
-  const outputLength = Math.floor(samples.length / ratio);
-  const pcm = new Int16Array(outputLength);
-
-  for (let i = 0; i < outputLength; i++) {
-    const start = Math.floor(i * ratio);
-    const end = Math.min(
-      Math.floor((i + 1) * ratio),
-      samples.length,
-    );
-
-    let sum = 0;
-    let count = 0;
-
-    for (let j = start; j < end; j++) {
-      sum += samples[j];
-      count++;
-    }
-
-    const sample = count > 0 ? sum / count : 0;
-    const clamped = Math.max(-1, Math.min(1, sample));
-
-    pcm[i] =
-      clamped < 0
-        ? clamped * 0x8000
-        : clamped * 0x7fff;
-  }
-
-  return pcm.buffer as ArrayBuffer;
-}
-
 export default function LiveVoicePage() {
   const [connected, setConnected] = useState(false);
+  const [starting, setStarting] = useState(false);
   const [status, setStatus] = useState("Not connected");
   const [error, setError] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -68,7 +34,7 @@ export default function LiveVoicePage() {
   const streamRef = useRef<MediaStream | null>(null);
   const contextRef = useRef<AudioContext | null>(null);
   const inputSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const processorRef = useRef<AudioWorkletNode | null>(null);
   const muteGainRef = useRef<GainNode | null>(null);
 
   const playbackNodesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
@@ -90,19 +56,19 @@ export default function LiveVoicePage() {
       try {
         node.disconnect();
       } catch {
-        // It may already be disconnected.
+        // The audio node may already be disconnected.
       }
     }
 
     playbackNodesRef.current.clear();
-    playbackCursorRef.current =
-      contextRef.current?.currentTime ?? 0;
+    playbackCursorRef.current = contextRef.current?.currentTime ?? 0;
   }, []);
 
   const releaseMedia = useCallback(() => {
     if (processorRef.current) {
-      processorRef.current.onaudioprocess = null;
+      processorRef.current.port.onmessage = null;
       processorRef.current.disconnect();
+      processorRef.current.port.close();
       processorRef.current = null;
     }
 
@@ -118,11 +84,11 @@ export default function LiveVoicePage() {
     const context = contextRef.current;
     contextRef.current = null;
 
+    clearPlayback();
+
     if (context && context.state !== "closed") {
       void context.close();
     }
-
-    clearPlayback();
   }, [clearPlayback]);
 
   const stopLive = useCallback(() => {
@@ -138,29 +104,30 @@ export default function LiveVoicePage() {
     releaseMedia();
 
     setConnected(false);
+    setStarting(false);
     setStatus("Not connected");
     setUserCaption("");
     setAssistantCaption("");
 
     userTranscriptRef.current = "";
     assistantTranscriptRef.current = "";
+    startInProgressRef.current = false;
   }, [releaseMedia]);
 
   const playAudioChunk = useCallback(async (data: ArrayBuffer) => {
     const context = contextRef.current;
 
-    if (!context || context.state === "closed") return;
+    if (!context || context.state === "closed") {
+      return;
+    }
 
-    // Gemini Live audio output is raw, little-endian PCM at 24 kHz.
-    if (data.byteLength < 2 || data.byteLength % 2 !== 0) return;
+    // Gemini Live returns raw PCM16 audio at 24 kHz.
+    if (data.byteLength < 2 || data.byteLength % 2 !== 0) {
+      return;
+    }
 
     const samples = new Int16Array(data);
-    const audioBuffer = context.createBuffer(
-      1,
-      samples.length,
-      24000,
-    );
-
+    const audioBuffer = context.createBuffer(1, samples.length, 24000);
     const channel = audioBuffer.getChannelData(0);
 
     for (let i = 0; i < samples.length; i++) {
@@ -192,6 +159,7 @@ export default function LiveVoicePage() {
       switch (event.type) {
         case "ready":
           setConnected(true);
+          setStarting(false);
           setStatus("Connected — speak naturally");
           break;
 
@@ -219,14 +187,16 @@ export default function LiveVoicePage() {
 
         case "turn_complete": {
           const userText = userTranscriptRef.current.trim();
-          const assistantText =
-            assistantTranscriptRef.current.trim();
+          const assistantText = assistantTranscriptRef.current.trim();
 
           setMessages((current) => {
             const next = [...current];
 
             if (userText) {
-              next.push({ role: "user", content: userText });
+              next.push({
+                role: "user",
+                content: userText,
+              });
             }
 
             if (assistantText) {
@@ -241,6 +211,7 @@ export default function LiveVoicePage() {
 
           userTranscriptRef.current = "";
           assistantTranscriptRef.current = "";
+
           setUserCaption("");
           setAssistantCaption("");
           setStatus("Connected — speak naturally");
@@ -257,10 +228,14 @@ export default function LiveVoicePage() {
   );
 
   const startLive = useCallback(async () => {
-    if (startInProgressRef.current || connected) return;
+    if (startInProgressRef.current || connected) {
+      return;
+    }
 
     startInProgressRef.current = true;
     manuallyStoppingRef.current = false;
+
+    setStarting(true);
     setError("");
     setStatus("Requesting microphone access...");
 
@@ -268,6 +243,12 @@ export default function LiveVoicePage() {
       if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error(
           "Microphone access is unavailable. Open the app in a supported browser on localhost or HTTPS.",
+        );
+      }
+
+      if (!("AudioWorkletNode" in window)) {
+        throw new Error(
+          "AudioWorklet is not supported in this browser. Try the latest Chrome or Edge.",
         );
       }
 
@@ -280,11 +261,23 @@ export default function LiveVoicePage() {
         },
       });
 
+      // The user may navigate away or cancel while permission is pending.
+      if (manuallyStoppingRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
       streamRef.current = stream;
 
       const context = new AudioContext();
       contextRef.current = context;
+
       await context.resume();
+      await context.audioWorklet.addModule("/pcm16-worklet.js");
+
+      if (manuallyStoppingRef.current) {
+        return;
+      }
 
       setStatus("Connecting to Gemini Live...");
 
@@ -301,6 +294,7 @@ export default function LiveVoicePage() {
                 : "Unable to play live audio.",
             );
           });
+
           return;
         }
 
@@ -325,7 +319,9 @@ export default function LiveVoicePage() {
         if (socketRef.current === socket) {
           socketRef.current = null;
           releaseMedia();
+
           setConnected(false);
+          setStarting(false);
           setStatus("Disconnected");
 
           if (!manuallyStoppingRef.current) {
@@ -363,40 +359,63 @@ export default function LiveVoicePage() {
           "close",
           () => {
             window.clearTimeout(timeout);
-            reject(new Error("The live connection closed before setup."));
+            reject(
+              new Error("The live connection closed before setup completed."),
+            );
           },
           { once: true },
         );
       });
 
+      if (manuallyStoppingRef.current) {
+        return;
+      }
+
       const inputSource = context.createMediaStreamSource(stream);
       inputSourceRef.current = inputSource;
 
-      // ScriptProcessorNode is broadly supported, though deprecated.
-      // It keeps this first version simple; AudioWorklet can replace it later.
-      const processor = context.createScriptProcessor(4096, 1, 1);
+      const processor = new AudioWorkletNode(context, "pcm16-worklet", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        processorOptions: {
+          targetSampleRate: 16000,
+          chunkSize: 1600,
+        },
+      });
+
       processorRef.current = processor;
 
+      processor.port.onmessage = (
+        event: MessageEvent<ArrayBuffer>,
+      ) => {
+        const audioData = event.data;
+
+        if (
+          audioData instanceof ArrayBuffer &&
+          audioData.byteLength > 0 &&
+          socket.readyState === WebSocket.OPEN
+        ) {
+          socket.send(audioData);
+        }
+      };
+
+      processor.onprocessorerror = () => {
+        setError(
+          "Microphone audio processing failed. Please restart the live session.",
+        );
+      };
+
+      // Send silence to the output to avoid local microphone feedback.
       const muteGain = context.createGain();
       muteGain.gain.value = 0;
       muteGainRef.current = muteGain;
-
-      processor.onaudioprocess = (audioEvent) => {
-        if (socket.readyState !== WebSocket.OPEN) return;
-
-        const samples = audioEvent.inputBuffer.getChannelData(0);
-        const pcm = convertToPcm16(samples, context.sampleRate);
-
-        if (pcm.byteLength > 0) {
-          socket.send(pcm);
-        }
-      };
 
       inputSource.connect(processor);
       processor.connect(muteGain);
       muteGain.connect(context.destination);
 
-      setStatus("Microphone ready — connecting to session...");
+      setStatus("Microphone ready — speak naturally");
     } catch (err) {
       releaseMedia();
 
@@ -408,14 +427,19 @@ export default function LiveVoicePage() {
       }
 
       setConnected(false);
+      setStarting(false);
       setStatus("Not connected");
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Could not start live voice.",
-      );
+
+      if (!manuallyStoppingRef.current) {
+        setError(
+          err instanceof Error
+            ? err.message
+            : "Could not start live voice.",
+        );
+      }
     } finally {
       startInProgressRef.current = false;
+      setStarting(false);
     }
   }, [
     connected,
@@ -436,13 +460,20 @@ export default function LiveVoicePage() {
       }
 
       if (processorRef.current) {
-        processorRef.current.onaudioprocess = null;
+        processorRef.current.port.onmessage = null;
         processorRef.current.disconnect();
+        processorRef.current.port.close();
+        processorRef.current = null;
       }
 
       inputSourceRef.current?.disconnect();
+      inputSourceRef.current = null;
+
       muteGainRef.current?.disconnect();
+      muteGainRef.current = null;
+
       streamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
 
       for (const node of playbackNodesRef.current) {
         try {
@@ -450,9 +481,18 @@ export default function LiveVoicePage() {
         } catch {
           // The node may already have stopped.
         }
+
+        try {
+          node.disconnect();
+        } catch {
+          // The node may already be disconnected.
+        }
       }
 
+      playbackNodesRef.current.clear();
+
       const context = contextRef.current;
+      contextRef.current = null;
 
       if (context && context.state !== "closed") {
         void context.close();
@@ -466,17 +506,21 @@ export default function LiveVoicePage() {
         <a className="back-link" href="/">
           ← Text chat
         </a>
+
         <span className="brand">✳ My AI Voice</span>
+
         <span className={`connection ${connected ? "online" : ""}`}>
           <span className="connection-dot" />
-          {connected ? "Live session" : "Offline"}
+          {connected ? "Live session" : starting ? "Connecting" : "Offline"}
         </span>
       </header>
 
       <section className="main-panel">
         <div className="hero">
           <p className="eyebrow">GEMINI LIVE</p>
+
           <h1>Talk naturally.</h1>
+
           <p className="subtitle">
             Speak normally and hear Gemini respond in real time.
             Your microphone stays active during the live session.
@@ -495,30 +539,31 @@ export default function LiveVoicePage() {
               <button
                 className="start-button"
                 onClick={() => void startLive()}
-                disabled={startInProgressRef.current}
+                disabled={starting}
               >
-                Start live conversation
+                {starting ? "Connecting..." : "Start live conversation"}
               </button>
             ) : (
-              <button
-                className="stop-button"
-                onClick={stopLive}
-              >
+              <button className="stop-button" onClick={stopLive}>
                 Stop conversation
               </button>
             )}
           </div>
 
           <p className="privacy-note">
-            Your browser streams microphone audio to your local backend,
-            which forwards it to Gemini. Use headphones to reduce echo.
+            My AI Voice was developed by Safar Ahmed and is powered by Gemini.
+            Your browser streams microphone audio to your backend, which
+            forwards it to Gemini. Use headphones to reduce echo.
           </p>
         </div>
 
         {error && (
           <div className="error-box" role="alert">
             <span>{error}</span>
-            <button onClick={() => setError("")} aria-label="Dismiss error">
+            <button
+              onClick={() => setError("")}
+              aria-label="Dismiss error"
+            >
               ×
             </button>
           </div>
@@ -534,7 +579,7 @@ export default function LiveVoicePage() {
 
           {assistantCaption && (
             <div className="caption-card assistant-caption">
-              <span className="caption-label">GEMINI</span>
+              <span className="caption-label">MY AI VOICE</span>
               <p>{assistantCaption}</p>
             </div>
           )}
@@ -542,6 +587,7 @@ export default function LiveVoicePage() {
 
         <section className="history">
           <h2>Conversation transcript</h2>
+
           {messages.length === 0 ? (
             <p className="empty-history">
               Your conversation will appear here after you speak.
@@ -553,8 +599,9 @@ export default function LiveVoicePage() {
                 className={`history-message ${message.role}`}
               >
                 <strong>
-                  {message.role === "user" ? "You" : "Gemini"}
+                  {message.role === "user" ? "You" : "My AI Voice"}
                 </strong>
+
                 <p>{message.content}</p>
               </article>
             ))
@@ -659,8 +706,16 @@ export default function LiveVoicePage() {
           border: 1px solid rgba(169, 153, 255, 0.22);
           border-radius: 50%;
           background:
-            radial-gradient(circle at 30% 25%, rgba(168, 126, 255, 0.3), transparent 48%),
-            radial-gradient(circle at 70% 80%, rgba(67, 130, 255, 0.24), transparent 48%),
+            radial-gradient(
+              circle at 30% 25%,
+              rgba(168, 126, 255, 0.3),
+              transparent 48%
+            ),
+            radial-gradient(
+              circle at 70% 80%,
+              rgba(67, 130, 255, 0.24),
+              transparent 48%
+            ),
             #171624;
           box-shadow: 0 0 70px rgba(127, 90, 240, 0.12);
           transition: box-shadow 180ms ease, transform 180ms ease;
@@ -717,7 +772,7 @@ export default function LiveVoicePage() {
           color: #fff;
         }
 
-        .start-button:hover,
+        .start-button:hover:not(:disabled),
         .stop-button:hover {
           transform: translateY(-1px);
         }
@@ -837,9 +892,11 @@ export default function LiveVoicePage() {
         }
 
         @keyframes orb-pulse {
-          0%, 100% {
+          0%,
+          100% {
             transform: scale(1);
           }
+
           50% {
             transform: scale(1.04);
           }
