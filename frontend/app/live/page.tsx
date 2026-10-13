@@ -13,7 +13,9 @@ type LiveServerEvent = {
   text?: string;
   message?: string;
   model?: string;
+  resumed?: boolean;
 };
+
 
 const API_URL = (
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
@@ -24,6 +26,7 @@ const LIVE_URL = `${API_URL.replace(/^http/, "ws")}/api/live`;
 export default function LiveVoicePage() {
   const [connected, setConnected] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [assistantSpeaking, setAssistantSpeaking] = useState(false);
   const [status, setStatus] = useState("Not connected");
   const [error, setError] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -39,13 +42,18 @@ export default function LiveVoicePage() {
 
   const playbackNodesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const playbackCursorRef = useRef(0);
+  const playbackGenerationRef = useRef(0);
 
   const userTranscriptRef = useRef("");
   const assistantTranscriptRef = useRef("");
   const manuallyStoppingRef = useRef(false);
   const startInProgressRef = useRef(false);
+  const liveReadyRef = useRef(false);
 
   const clearPlayback = useCallback(() => {
+    // Invalidate callbacks belonging to audio that is being stopped.
+    playbackGenerationRef.current += 1;
+
     for (const node of playbackNodesRef.current) {
       try {
         node.stop();
@@ -62,6 +70,7 @@ export default function LiveVoicePage() {
 
     playbackNodesRef.current.clear();
     playbackCursorRef.current = contextRef.current?.currentTime ?? 0;
+    setAssistantSpeaking(false);
   }, []);
 
   const releaseMedia = useCallback(() => {
@@ -81,10 +90,10 @@ export default function LiveVoicePage() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
 
+    clearPlayback();
+
     const context = contextRef.current;
     contextRef.current = null;
-
-    clearPlayback();
 
     if (context && context.state !== "closed") {
       void context.close();
@@ -105,6 +114,7 @@ export default function LiveVoicePage() {
 
     setConnected(false);
     setStarting(false);
+    setAssistantSpeaking(false);
     setStatus("Not connected");
     setUserCaption("");
     setAssistantCaption("");
@@ -121,9 +131,12 @@ export default function LiveVoicePage() {
       return;
     }
 
-    // Gemini Live returns raw PCM16 audio at 24 kHz.
     if (data.byteLength < 2 || data.byteLength % 2 !== 0) {
       return;
+    }
+
+    if (context.state === "suspended") {
+      await context.resume();
     }
 
     const samples = new Int16Array(data);
@@ -134,7 +147,9 @@ export default function LiveVoicePage() {
       channel[i] = samples[i] / 32768;
     }
 
+    const generation = playbackGenerationRef.current;
     const source = context.createBufferSource();
+
     source.buffer = audioBuffer;
     source.connect(context.destination);
 
@@ -143,6 +158,20 @@ export default function LiveVoicePage() {
     source.onended = () => {
       playbackNodesRef.current.delete(source);
       source.disconnect();
+
+      // Ignore callbacks from audio that was interrupted or cancelled.
+      if (generation !== playbackGenerationRef.current) {
+        return;
+      }
+
+      // Only mark playback finished after the last queued chunk ends.
+      if (playbackNodesRef.current.size === 0) {
+        setAssistantSpeaking(false);
+
+        if (socketRef.current?.readyState === WebSocket.OPEN) {
+          setStatus("Connected — speak naturally");
+        }
+      }
     };
 
     const startAt = Math.max(
@@ -151,17 +180,45 @@ export default function LiveVoicePage() {
     );
 
     playbackCursorRef.current = startAt + audioBuffer.duration;
+
+    setAssistantSpeaking(true);
+    setStatus("My AI Voice is speaking — you can interrupt");
+
     source.start(startAt);
   }, []);
 
   const handleServerEvent = useCallback(
     (event: LiveServerEvent) => {
       switch (event.type) {
-        case "ready":
-          setConnected(true);
-          setStarting(false);
-          setStatus("Connected — speak naturally");
-          break;
+        
+case "ready":
+  liveReadyRef.current = false;
+  setConnected(true);
+  setStarting(false);
+  setStatus("Connected — speak naturally");
+  setError("");
+  break;
+
+case "reconnecting":
+  liveReadyRef.current = false;
+  clearPlayback();
+  setStatus(
+    event.message || "Reconnecting to Gemini Live. Please wait.",
+  );
+  break;
+
+case "resumed":
+  liveReadyRef.current = true;
+  setConnected(true);
+  setStarting(false);
+  setStatus(
+    event.resumed === false
+      ? "Reconnected to a new session — speak naturally"
+      : "Session resumed — speak naturally",
+  );
+  setError("");
+  break;
+
 
         case "input_transcription":
           if (event.text) {
@@ -174,16 +231,52 @@ export default function LiveVoicePage() {
           if (event.text) {
             assistantTranscriptRef.current += event.text;
             setAssistantCaption(assistantTranscriptRef.current);
-            setStatus("Gemini is responding");
+
+            if (!assistantSpeaking) {
+              setStatus("Preparing a response...");
+            }
           }
           break;
 
-        case "interrupted":
+        case "interrupted": {
           clearPlayback();
+
+          const interruptedUser = userTranscriptRef.current.trim();
+          const interruptedAssistant =
+            assistantTranscriptRef.current.trim();
+
+          // Preserve the interrupted turn rather than merging its text
+          // into the next user utterance.
+          if (interruptedUser || interruptedAssistant) {
+            setMessages((current) => {
+              const next = [...current];
+
+              if (interruptedUser) {
+                next.push({
+                  role: "user",
+                  content: interruptedUser,
+                });
+              }
+
+              if (interruptedAssistant) {
+                next.push({
+                  role: "assistant",
+                  content: `${interruptedAssistant} [interrupted]`,
+                });
+              }
+
+              return next;
+            });
+          }
+
+          userTranscriptRef.current = "";
           assistantTranscriptRef.current = "";
+
+          setUserCaption("");
           setAssistantCaption("");
-          setStatus("Listening — you can speak");
+          setStatus("Listening — speak now");
           break;
+        }
 
         case "turn_complete": {
           const userText = userTranscriptRef.current.trim();
@@ -214,7 +307,17 @@ export default function LiveVoicePage() {
 
           setUserCaption("");
           setAssistantCaption("");
-          setStatus("Connected — speak naturally");
+
+          // turn_complete may arrive before the final scheduled audio
+          // has physically finished playing.
+          if (playbackNodesRef.current.size > 0) {
+            setAssistantSpeaking(true);
+            setStatus("My AI Voice is speaking — you can interrupt");
+          } else {
+            setAssistantSpeaking(false);
+            setStatus("Connected — speak naturally");
+          }
+
           break;
         }
 
@@ -224,7 +327,7 @@ export default function LiveVoicePage() {
           break;
       }
     },
-    [clearPlayback],
+    [assistantSpeaking, clearPlayback],
   );
 
   const startLive = useCallback(async () => {
@@ -242,7 +345,7 @@ export default function LiveVoicePage() {
     try {
       if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error(
-          "Microphone access is unavailable. Open the app in a supported browser on localhost or HTTPS.",
+          "Microphone access is unavailable. Open the app on localhost or HTTPS.",
         );
       }
 
@@ -261,7 +364,6 @@ export default function LiveVoicePage() {
         },
       });
 
-      // The user may navigate away or cancel while permission is pending.
       if (manuallyStoppingRef.current) {
         stream.getTracks().forEach((track) => track.stop());
         return;
@@ -322,6 +424,7 @@ export default function LiveVoicePage() {
 
           setConnected(false);
           setStarting(false);
+          setAssistantSpeaking(false);
           setStatus("Disconnected");
 
           if (!manuallyStoppingRef.current) {
@@ -367,7 +470,10 @@ export default function LiveVoicePage() {
         );
       });
 
-      if (manuallyStoppingRef.current) {
+      if (
+        manuallyStoppingRef.current ||
+        socket.readyState !== WebSocket.OPEN
+      ) {
         return;
       }
 
@@ -394,6 +500,7 @@ export default function LiveVoicePage() {
         if (
           audioData instanceof ArrayBuffer &&
           audioData.byteLength > 0 &&
+          liveReadyRef.current &&
           socket.readyState === WebSocket.OPEN
         ) {
           socket.send(audioData);
@@ -406,7 +513,6 @@ export default function LiveVoicePage() {
         );
       };
 
-      // Send silence to the output to avoid local microphone feedback.
       const muteGain = context.createGain();
       muteGain.gain.value = 0;
       muteGainRef.current = muteGain;
@@ -479,7 +585,7 @@ export default function LiveVoicePage() {
         try {
           node.stop();
         } catch {
-          // The node may already have stopped.
+          // The audio node may already have stopped.
         }
 
         try {
@@ -518,17 +624,32 @@ export default function LiveVoicePage() {
       <section className="main-panel">
         <div className="hero">
           <p className="eyebrow">GEMINI LIVE</p>
-
           <h1>Talk naturally.</h1>
 
           <p className="subtitle">
-            Speak normally and hear Gemini respond in real time.
-            Your microphone stays active during the live session.
+            Speak normally and hear My AI Voice respond in real time.
           </p>
 
-          <div className={`orb ${connected ? "orb-active" : ""}`}>
+          <div
+            className={`orb ${
+              connected ? "orb-active" : ""
+            } ${assistantSpeaking ? "orb-speaking" : ""}`}
+          >
             <span className="orb-inner">✳</span>
           </div>
+
+          {assistantSpeaking && (
+            <div className="audio-indicator" role="status">
+              <span className="sound-wave" aria-hidden="true">
+                <i />
+                <i />
+                <i />
+                <i />
+                <i />
+              </span>
+              My AI Voice is speaking — you can interrupt.
+            </div>
+          )}
 
           <p className="status" role="status">
             {status}
@@ -601,7 +722,6 @@ export default function LiveVoicePage() {
                 <strong>
                   {message.role === "user" ? "You" : "My AI Voice"}
                 </strong>
-
                 <p>{message.content}</p>
               </article>
             ))
@@ -726,6 +846,11 @@ export default function LiveVoicePage() {
           box-shadow: 0 0 80px rgba(127, 90, 240, 0.3);
         }
 
+        .orb-speaking {
+          box-shadow: 0 0 95px rgba(100, 220, 180, 0.3);
+          border-color: rgba(110, 240, 190, 0.45);
+        }
+
         .orb-inner {
           display: grid;
           place-items: center;
@@ -740,9 +865,43 @@ export default function LiveVoicePage() {
 
         .status {
           min-height: 20px;
-          margin: 0;
+          margin: 12px 0 0;
           color: #c0bfd2;
           font-size: 13px;
+        }
+
+        .audio-indicator {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 10px;
+          color: #a5f3cf;
+          font-size: 12px;
+        }
+
+        .sound-wave {
+          display: inline-flex;
+          align-items: center;
+          gap: 3px;
+          height: 20px;
+        }
+
+        .sound-wave i {
+          display: block;
+          width: 3px;
+          height: 7px;
+          border-radius: 4px;
+          background: #6ee7b7;
+          animation: sound-wave-motion 0.7s ease-in-out infinite alternate;
+        }
+
+        .sound-wave i:nth-child(2),
+        .sound-wave i:nth-child(4) {
+          animation-delay: 0.2s;
+        }
+
+        .sound-wave i:nth-child(3) {
+          animation-delay: 0.4s;
         }
 
         .controls {
@@ -902,6 +1061,16 @@ export default function LiveVoicePage() {
           }
         }
 
+        @keyframes sound-wave-motion {
+          from {
+            height: 5px;
+          }
+
+          to {
+            height: 19px;
+          }
+        }
+
         @media (max-width: 600px) {
           .topbar {
             flex-wrap: wrap;
@@ -930,7 +1099,8 @@ export default function LiveVoicePage() {
         }
 
         @media (prefers-reduced-motion: reduce) {
-          .orb-active {
+          .orb-active,
+          .sound-wave i {
             animation: none;
           }
 

@@ -1,4 +1,4 @@
-
+from groq import AsyncGroq
 import asyncio
 import logging
 import os
@@ -32,6 +32,19 @@ GEMINI_LIVE_MODEL = os.getenv(
 client = (
     genai.Client(api_key=GEMINI_API_KEY)
     if GEMINI_API_KEY
+    else None
+)
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+GROQ_ENABLE_WEB_SEARCH = (
+    os.getenv("GROQ_ENABLE_WEB_SEARCH", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
+groq_client = (
+    AsyncGroq(api_key=GROQ_API_KEY)
+    if GROQ_API_KEY
     else None
 )
 
@@ -143,16 +156,23 @@ async def root():
     }
 
 
+
 @app.get("/api/health")
 async def health():
     return {
         "status": "ok",
-        "ai_configured": client is not None,
-        "provider": "Gemini" if client else None,
-        "model": GEMINI_MODEL if client else None,
+        "ai_configured": groq_client is not None,
+        "provider": "Groq" if groq_client else None,
+        "model": GROQ_MODEL if groq_client else None,
+        "web_search_enabled": (
+            GROQ_ENABLE_WEB_SEARCH and groq_client is not None
+        ),
+        "live_ai_configured": client is not None,
+        "live_provider": "Gemini" if client else None,
         "live_model": GEMINI_LIVE_MODEL if client else None,
-        "web_search_enabled": client is not None,
     }
+
+
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -171,95 +191,142 @@ async def chat(request: ChatRequest):
             detail="The latest message must be from the user.",
         )
 
-    if client is None:
-        return ChatResponse(
-            reply=(
-                "I'm running in demo mode. Add a Gemini API key "
-                "to enable real AI responses."
+    if groq_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Groq is not configured. Add GROQ_API_KEY "
+                "to backend/.env and restart FastAPI."
             ),
-            mode="demo",
         )
 
-    contents = [
-        {
-            "role": "model" if message.role == "assistant" else "user",
-            "parts": [{"text": message.content}],
-        }
-        for message in request.messages
+    system_message = {
+        "role": "system",
+        "content": (
+            "You are My AI Voice, a personal AI assistant application "
+            "developed by Safar Ahmed and powered by an AI language model. "
+            "When asked who developed this application, say Safar Ahmed "
+            "developed My AI Voice. Do not claim that Safar created or "
+            "trained the underlying AI model. Be helpful, friendly, clear, "
+            "and concise. For questions that need current information, "
+            "use the available browser search tool when enabled. Never "
+            "claim to have searched the web unless you actually used it. "
+            "Be honest when you cannot verify current facts."
+        ),
+    }
+
+    conversation = [
+        {"role": message.role, "content": message.content}
+        for message in request.messages[-20:]
     ]
 
+    messages = [system_message, *conversation]
+
+    async def request_completion(use_search: bool):
+        options = {
+            "model": GROQ_MODEL,
+            "messages": messages,
+            "max_completion_tokens": 1200,
+            "temperature": 1,
+        }
+
+        if use_search:
+            options["tools"] = [{"type": "browser_search"}]
+            options["tool_choice"] = "auto"
+
+        return await groq_client.chat.completions.create(**options)
+
     try:
-        response = await client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                
-            system_instruction=(
-                "You are My AI Voice, a personal AI assistant application "
-                "developed by Safar Ahmed. Safar Ahmed is the developer of "
-                "this application and its user-facing experience. The application "
-                "uses Google's Gemini model as its underlying AI engine. "
-                "When someone asks who created you, who made you, or who your "
-                "developer is, answer naturally that you are My AI Voice, "
-                "developed by Safar Ahmed and powered by Gemini. Do not answer "
-                "only 'Google' or 'Gemini' when the question is about who developed "
-                "this application. Do not claim Safar trained or created the "
-                "underlying Gemini model. If asked who created Gemini itself, "
-                "explain that Google developed Gemini. "
-                "Answer naturally, accurately, and clearly. Prefer concise "
-                "responses that sound good aloud. For recent events, current "
-                "information, prices, or facts that may have changed, use Google "
-                "Search when it helps answer accurately. Do not claim to have "
-                "searched unless search was actually used."
-            ),
+        try:
+            response = await request_completion(GROQ_ENABLE_WEB_SEARCH)
 
-                tools=[
-                    types.Tool(
-                        google_search=types.GoogleSearch()
-                    )
-                ],
-            ),
-        )
+        except Exception as search_error:
+            status_code = getattr(search_error, "status_code", None)
 
-        reply = (response.text or "").strip()
+            # If the account or model cannot use browser search, retry
+            # once as ordinary text chat instead of failing completely.
+            if (
+                GROQ_ENABLE_WEB_SEARCH
+                and status_code in {400, 403, 404, 422}
+            ):
+                logger.warning(
+                    "Groq browser search was rejected (HTTP %s). "
+                    "Retrying without web search.",
+                    status_code,
+                )
+                response = await request_completion(False)
+            else:
+                raise
 
-        if not reply:
+        if not response.choices:
             raise HTTPException(
                 status_code=502,
-                detail="The AI provider returned an empty response.",
+                detail="Groq returned no response choices.",
             )
 
-        sources = extract_sources(response)
+        reply = response.choices[0].message.content
+
+        if not isinstance(reply, str) or not reply.strip():
+            raise HTTPException(
+                status_code=502,
+                detail="Groq returned an empty response.",
+            )
 
         logger.info(
-            "Text response generated with %d source(s).",
-            len(sources),
+            "Groq response generated using model %s; web search configured: %s",
+            GROQ_MODEL,
+            GROQ_ENABLE_WEB_SEARCH,
         )
 
         return ChatResponse(
-            reply=reply,
+            reply=reply.strip(),
             mode="ai",
-            sources=sources,
+            sources=[],
         )
 
     except HTTPException:
         raise
 
-    except errors.APIError as exc:
-        logger.warning(
-            "Gemini text API error: code=%s, message=%s",
-            exc.code,
-            exc.message,
-        )
+    except Exception as exc:
+        status_code = getattr(exc, "status_code", None)
 
-        if exc.code == 503:
+        logger.exception("Groq chat request failed")
+
+        if status_code == 429:
             raise HTTPException(
-                status_code=503,
+                status_code=429,
                 detail=(
-                    "Gemini is temporarily overloaded. "
-                    "Wait briefly and try again."
+                    "The Groq free-tier rate limit has been reached. "
+                    "Wait for the limit to reset, then try again."
                 ),
             ) from exc
+
+        if status_code in {401, 403}:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Groq rejected the API key or model access. "
+                    "Check your key and model permissions."
+                ),
+            ) from exc
+
+        if status_code == 400:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Groq rejected the request. Check GROQ_MODEL "
+                    "and the backend terminal for details."
+                ),
+            ) from exc
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "The Groq AI request failed. Check the backend "
+                "terminal for details."
+            ),
+        ) from exc
+
 
         if exc.code == 429:
             raise HTTPException(
@@ -281,6 +348,8 @@ async def chat(request: ChatRequest):
             status_code=502,
             detail="An unexpected error occurred while contacting Gemini.",
         ) from exc
+
+
 
 
 @app.websocket("/api/live")
@@ -310,24 +379,17 @@ async def live_voice(websocket: WebSocket):
                     }
                 }
             },
-            
-                "system_instruction": (
-                    "You are My AI Voice, a friendly personal AI assistant "
-                    "application developed by Safar Ahmed and powered by Google's "
-                    "Gemini model. Safar Ahmed is the developer of this application. "
-                    "When users ask who created you, who made you, or who developed "
-                    "this assistant, tell them that Safar Ahmed developed My AI Voice "
-                    "and that Gemini powers its AI responses. Do not say that Google "
-                    "created this application. Do not claim that Safar trained or "
-                    "created the underlying Gemini model. If someone asks who created "
-                    "Gemini itself, explain that Google developed Gemini. "
-                    "Speak naturally and conversationally. Keep responses clear and "
-                    "reasonably concise. Listen to the user's request and answer what "
-                    "they actually asked. For current events, recent information, or "
-                    "facts that may have changed, use Google Search when useful. "
-                    "Do not claim to have searched unless search was actually used."
-                ),
-
+            "system_instruction": (
+                "You are My AI Voice, a personal AI assistant "
+                "application developed by Safar Ahmed and powered "
+                "by Google's Gemini model. If asked who developed "
+                "this application, say Safar Ahmed developed My AI "
+                "Voice. Do not claim that Safar created or trained "
+                "the underlying Gemini model. Speak naturally and "
+                "concisely. Use Google Search when useful for current "
+                "information, and do not claim to have searched unless "
+                "you actually used search."
+            ),
         }
 
         async with client.aio.live.connect(
@@ -358,11 +420,25 @@ async def live_voice(websocket: WebSocket):
                         )
 
             async def receive_gemini_responses():
-                # The SDK's receive() iterator completes at the end
-                # of an interaction. Re-enter it for later turns
-                # without closing the persistent Live session.
                 while True:
                     async for response in session.receive():
+                        if response.go_away is not None:
+                            logger.warning(
+                                "Gemini Live session is approaching "
+                                "its connection limit: %s",
+                                response.go_away.time_left,
+                            )
+
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": (
+                                    "The Live session is about to close. "
+                                    "Stop the conversation and start a "
+                                    "new session."
+                                ),
+                            })
+                            return
+
                         content = response.server_content
 
                         if content is None:
@@ -405,11 +481,13 @@ async def live_voice(websocket: WebSocket):
                                 "type": "turn_complete",
                             })
 
-            mic_task = asyncio.create_task(send_microphone_audio())
-            response_task = asyncio.create_task(
-                receive_gemini_responses()
-            )
-            tasks = {mic_task, response_task}
+                    # The SDK receive iterator can end at a turn boundary.
+                    # Keep this same session open for the next user turn.
+                    await asyncio.sleep(0)
+
+            sender_task = asyncio.create_task(send_microphone_audio())
+            receiver_task = asyncio.create_task(receive_gemini_responses())
+            tasks = {sender_task, receiver_task}
 
             try:
                 done, pending = await asyncio.wait(
@@ -448,18 +526,14 @@ async def live_voice(websocket: WebSocket):
         logger.info("Live voice client disconnected.")
 
     except errors.APIError as exc:
-        logger.warning(
-            "Gemini Live API error: code=%s, message=%s",
-            exc.code,
-            exc.message,
-        )
+        logger.exception("Gemini Live API error")
 
         try:
             await websocket.send_json({
                 "type": "error",
                 "message": (
                     f"Gemini Live returned error {exc.code}. "
-                    "Check the model, API access, and usage limits."
+                    "Check the backend terminal for details."
                 ),
             })
         except Exception:
@@ -472,8 +546,8 @@ async def live_voice(websocket: WebSocket):
             await websocket.send_json({
                 "type": "error",
                 "message": (
-                    "The live session failed. Check the backend terminal "
-                    "for details."
+                    "The live session failed. Check the backend "
+                    "terminal for the exact error."
                 ),
             })
         except Exception:
@@ -484,3 +558,5 @@ async def live_voice(websocket: WebSocket):
             await websocket.close()
         except Exception:
             pass
+
+
