@@ -1,6 +1,7 @@
 
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 type Source = {
@@ -153,6 +154,138 @@ function formatChatDate(timestamp: number): string {
   });
 }
 
+function getHostname(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
+const SUGGESTIONS = [
+  {
+    title: "Explain a concept",
+    prompt: "Explain how large language models work in simple terms.",
+  },
+  {
+    title: "Get today's news",
+    prompt: "What are the top technology news stories today?",
+  },
+  {
+    title: "Plan my day",
+    prompt: "Help me plan a productive day with focused work blocks.",
+  },
+  {
+    title: "Practice speaking",
+    prompt: "Let's have a short English conversation practice.",
+  },
+];
+
+type IconProps = { size?: number };
+
+function Icon({
+  size = 18,
+  children,
+}: IconProps & { children: React.ReactNode }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {children}
+    </svg>
+  );
+}
+
+const SparkIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M5.6 18.4l2.8-2.8M15.6 8.4l2.8-2.8" />
+  </Icon>
+);
+
+const PlusIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M12 5v14M5 12h14" />
+  </Icon>
+);
+
+const MenuIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M4 6h16M4 12h16M4 18h16" />
+  </Icon>
+);
+
+const CloseIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M6 6l12 12M18 6L6 18" />
+  </Icon>
+);
+
+const MicIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <rect x="9" y="3" width="6" height="11" rx="3" />
+    <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
+  </Icon>
+);
+
+const StopIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor" />
+  </Icon>
+);
+
+const SendIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M12 19V5M5 12l7-7 7 7" />
+  </Icon>
+);
+
+const SpeakerIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M11 5L6 9H3v6h3l5 4V5z" />
+    <path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13" />
+  </Icon>
+);
+
+const SpeakerOffIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M11 5L6 9H3v6h3l5 4V5z" />
+    <path d="M22 9l-6 6M16 9l6 6" />
+  </Icon>
+);
+
+const CopyIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15V5a2 2 0 0 1 2-2h8" />
+  </Icon>
+);
+
+const CheckIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M5 12.5l4.5 4.5L19 7.5" />
+  </Icon>
+);
+
+const WaveIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M3 12h2M7 8v8M11 5v14M15 8v8M19 11v2" />
+  </Icon>
+);
+
+const ChatIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z" />
+  </Icon>
+);
+
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([initialMessage]);
   const [input, setInput] = useState("");
@@ -165,7 +298,12 @@ export default function Home() {
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [activeChatId, setActiveChatId] = useState("");
   const [storageLoaded, setStorageLoaded] = useState(false);
-  const [historyOpen, setHistoryOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
+  const [speakingIndex, setSpeakingIndex] = useState<number | null>(null);
+
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceStateRef = useRef<VoiceState>("idle");
@@ -194,9 +332,9 @@ export default function Home() {
   }, [changeVoiceState]);
 
   const speak = useCallback(
-    (text: string) => {
+    (text: string, force = false) => {
       if (
-        !autoSpeak ||
+        (!autoSpeak && !force) ||
         typeof window === "undefined" ||
         !("speechSynthesis" in window)
       ) {
@@ -411,7 +549,7 @@ export default function Home() {
   const switchConversation = useCallback(
     (session: ChatSession) => {
       if (session.id === activeChatIdRef.current) {
-        setHistoryOpen(false);
+        setSidebarOpen(false);
         return;
       }
 
@@ -429,7 +567,7 @@ export default function Home() {
       setError("");
       setMode(null);
       changeVoiceState("idle");
-      setHistoryOpen(false);
+      setSidebarOpen(false);
     },
     [
       stopListening,
@@ -624,6 +762,7 @@ export default function Home() {
         setMessages(updatedMessages);
         setMode(data.mode);
         latestReplyRef.current = data.reply.trim();
+        setSpeakingIndex(updatedMessages.length - 1);
 
         if (mountedRef.current) {
           speak(data.reply);
@@ -663,6 +802,25 @@ export default function Home() {
     ],
   );
 
+
+  // Grow the message box with its content, up to a comfortable limit.
+  useEffect(() => {
+    const textarea = textareaRef.current;
+
+    if (!textarea) return;
+
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
+  }, [input]);
+
+  // Keep the newest message in view.
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "end",
+    });
+  }, [messages, voiceState]);
+
   const handleMicrophoneClick = () => {
     if (voiceState === "listening") {
       stopListening();
@@ -676,130 +834,195 @@ export default function Home() {
     void sendMessage();
   };
 
-  const statusText: Record<VoiceState, string> = {
-    idle: "Ready when you are",
-    listening: "Listening — speak now",
-    processing: "Thinking...",
-    speaking: "Speaking — you can interrupt",
+  const handleComposerKeyDown = (
+    event: React.KeyboardEvent<HTMLTextAreaElement>,
+  ) => {
+    if (
+      event.key === "Enter" &&
+      !event.shiftKey &&
+      !event.nativeEvent.isComposing
+    ) {
+      event.preventDefault();
+      void sendMessage();
+    }
   };
 
+  const handleAutoSpeakToggle = () => {
+    const enabled = !autoSpeak;
+    setAutoSpeak(enabled);
+
+    if (!enabled) {
+      stopSpeaking();
+    }
+  };
+
+  const handleCopy = async (text: string, index: number) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedIndex(index);
+      window.setTimeout(() => {
+        setCopiedIndex((current) => (current === index ? null : current));
+      }, 1600);
+    } catch {
+      setError("Could not copy to the clipboard.");
+    }
+  };
+
+  const handleReadAloud = (text: string, index: number) => {
+    if (voiceState === "speaking" && speakingIndex === index) {
+      stopSpeaking();
+      return;
+    }
+
+    setSpeakingIndex(index);
+    speak(text, true);
+  };
+
+  const statusText: Record<VoiceState, string> = {
+    idle: "Ready",
+    listening: "Listening",
+    processing: "Thinking",
+    speaking: "Speaking",
+  };
+
+  const hasUserMessages = messages.some(
+    (message) => message.role === "user",
+  );
+
+  const activeTitle =
+    chatSessions.find((session) => session.id === activeChatId)?.title ??
+    "New conversation";
+
+  const isProcessing = voiceState === "processing";
+  const isListening = voiceState === "listening";
+
   return (
-    <main className="app-shell">
-      <aside className="sidebar">
-        <div className="brand-block">
-          <div className="brand-mark">✳</div>
-          <h1>My AI Voice</h1>
-          <p className="sidebar-subtitle">
-            Developed by Safar Ahmed
-          </p>
-        </div>
+    <div className="app-shell">
+      {sidebarOpen && (
+        <div
+          className="sidebar-backdrop"
+          onClick={() => setSidebarOpen(false)}
+          aria-hidden="true"
+        />
+      )}
 
-        <button
-          type="button"
-          className="new-chat-button"
-          onClick={startNewConversation}
-        >
-          <span aria-hidden="true">＋</span>
-          New conversation
-        </button>
-
-        <div className="sidebar-status">
-          <span
-            className={`status-dot status-${voiceState}`}
-            aria-hidden="true"
-          />
-          <span>{statusText[voiceState]}</span>
-        </div>
-
-        <section className="sidebar-conversations">
-          <div className="sidebar-section-heading">
-            <span>Recent conversations</span>
-
-            <button
-              type="button"
-              className="history-toggle"
-              onClick={() => setHistoryOpen((open) => !open)}
-              aria-label={
-                historyOpen ? "Collapse history" : "Expand history"
-              }
-            >
-              {historyOpen ? "−" : "+"}
-            </button>
-          </div>
-
-          {historyOpen && (
-            <div className="sidebar-chat-list">
-              {chatSessions.map((session) => (
-                <button
-                  key={session.id}
-                  type="button"
-                  className={`chat-session-button ${
-                    session.id === activeChatId ? "active" : ""
-                  }`}
-                  onClick={() => switchConversation(session)}
-                  title={session.title}
-                >
-                  <span className="chat-session-title">
-                    {session.title}
-                  </span>
-                  <span className="chat-session-date">
-                    {formatChatDate(session.updatedAt)}
-                  </span>
-                </button>
-              ))}
+      <aside
+        className={`sidebar ${sidebarOpen ? "open" : ""}`}
+        aria-label="Conversations"
+      >
+        <div className="sidebar-header">
+          <div className="brand-lockup">
+            <span className="brand-logo">
+              <SparkIcon size={18} />
+            </span>
+            <div className="brand-text">
+              <strong>My AI Voice</strong>
+              <span>by Safar Ahmed</span>
             </div>
-          )}
-        </section>
-
-        <div className="sidebar-settings">
-          <label className="setting-row">
-            <span>Speak replies aloud</span>
-            <input
-              type="checkbox"
-              checked={autoSpeak}
-              onChange={(event) => {
-                const enabled = event.target.checked;
-                setAutoSpeak(enabled);
-
-                if (!enabled) {
-                  stopSpeaking();
-                }
-              }}
-            />
-          </label>
-
-          <p className="sidebar-hint">
-            {voiceSupported
-              ? "Browser voice input is available."
-              : "Voice input needs Chrome or Edge. Text chat is still available."}
-          </p>
-        </div>
-
-        <div className="sidebar-footer">
-          <span>
-            {mode === "ai"
-              ? "Groq AI connected"
-              : "Your personal AI assistant"}
-          </span>
-          <span className="storage-note">Saved in this browser</span>
-        </div>
-      </aside>
-
-      <section className="workspace">
-        <header className="workspace-header">
-          <div>
-            <p className="eyebrow">PERSONAL ASSISTANT</p>
-            <h2>Conversation</h2>
           </div>
 
           <button
             type="button"
-            className="stop-button"
-            onClick={stopSpeaking}
-            disabled={voiceState !== "speaking"}
+            className="icon-button sidebar-close"
+            onClick={() => setSidebarOpen(false)}
+            aria-label="Close sidebar"
           >
-            Stop voice
+            <CloseIcon />
           </button>
+        </div>
+
+        <div className="sidebar-actions">
+          <button
+            type="button"
+            className="new-chat-button"
+            onClick={() => {
+              startNewConversation();
+              setSidebarOpen(false);
+            }}
+          >
+            <PlusIcon size={16} />
+            New chat
+          </button>
+
+          <Link href="/live" className="sidebar-link">
+            <WaveIcon size={16} />
+            Live voice mode
+          </Link>
+        </div>
+
+        <nav className="history-nav" aria-label="Recent conversations">
+          <p className="sidebar-label">Recent</p>
+
+          <ul className="history-list">
+            {chatSessions.map((session) => (
+              <li key={session.id}>
+                <button
+                  type="button"
+                  className={`history-item ${
+                    session.id === activeChatId ? "active" : ""
+                  }`}
+                  onClick={() => switchConversation(session)}
+                  title={session.title}
+                  aria-current={
+                    session.id === activeChatId ? "page" : undefined
+                  }
+                >
+                  <ChatIcon size={15} />
+                  <span className="history-title">{session.title}</span>
+                  <span className="history-date">
+                    {formatChatDate(session.updatedAt)}
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </nav>
+
+        <div className="sidebar-footer">
+          <span
+            className={`connection-indicator ${
+              mode === "ai" ? "connected" : ""
+            }`}
+            aria-hidden="true"
+          />
+          <div>
+            <strong>
+              {mode === "ai" ? "Groq AI connected" : "Personal assistant"}
+            </strong>
+            <span>History is saved in this browser</span>
+          </div>
+        </div>
+      </aside>
+
+      <main className="workspace">
+        <header className="chat-header">
+          <button
+            type="button"
+            className="icon-button menu-toggle"
+            onClick={() => setSidebarOpen(true)}
+            aria-label="Open sidebar"
+          >
+            <MenuIcon />
+          </button>
+
+          <h1 className="chat-title">{activeTitle}</h1>
+
+          <div className="chat-header-actions">
+            <span className={`state-pill state-${voiceState}`}>
+              <span className="state-dot" aria-hidden="true" />
+              {statusText[voiceState]}
+            </span>
+
+            <button
+              type="button"
+              className="icon-button header-new-chat"
+              onClick={startNewConversation}
+              aria-label="New chat"
+              title="New chat"
+            >
+              <PlusIcon />
+            </button>
+          </div>
         </header>
 
         <section
@@ -807,161 +1030,279 @@ export default function Home() {
           aria-label="Chat conversation"
           aria-live="polite"
         >
-          <div className="message-list">
-            {messages.map((message, index) => (
-              <article
-                key={`${index}-${message.role}`}
-                className={`message-row ${message.role}`}
-              >
-                <div className="message-avatar">
-                  {message.role === "assistant" ? "✳" : "You"}
+          <div className="conversation-inner">
+            {!hasUserMessages ? (
+              <div className="welcome">
+                <span className="welcome-logo">
+                  <SparkIcon size={28} />
+                </span>
+                <h2>How can I help you today?</h2>
+                <p>
+                  Type a message or tap the microphone to talk. Turn on
+                  voice replies to hear the answers out loud.
+                </p>
+
+                <div className="suggestion-grid">
+                  {SUGGESTIONS.map((suggestion) => (
+                    <button
+                      key={suggestion.title}
+                      type="button"
+                      className="suggestion-card"
+                      onClick={() => void sendMessage(suggestion.prompt)}
+                      disabled={isProcessing}
+                    >
+                      <strong>{suggestion.title}</strong>
+                      <span>{suggestion.prompt}</span>
+                    </button>
+                  ))}
                 </div>
-
-                <div className="message-content">
-                  <p className="message-author">
-                    {message.role === "assistant"
-                      ? "My AI Voice"
-                      : "You"}
-                  </p>
-
-                  <div className="message-bubble">
-                    <p>{message.content}</p>
-                  </div>
-
-                  {message.role === "assistant" &&
-                    index > 0 &&
-                    index === messages.length - 1 && (
-                      <button
-                        type="button"
-                        className="replay-button"
-                        onClick={() => speak(message.content)}
-                        disabled={voiceState === "listening"}
-                      >
-                        <span aria-hidden="true">▶</span>
-                        Replay voice
-                      </button>
+              </div>
+            ) : (
+              <div className="message-list">
+                {messages.map((message, index) => (
+                  <article
+                    key={`${index}-${message.role}`}
+                    className={`message ${message.role}`}
+                  >
+                    {message.role === "assistant" && (
+                      <span className="message-avatar">
+                        <SparkIcon size={16} />
+                      </span>
                     )}
 
-                  {message.role === "assistant" &&
-                    message.sources &&
-                    message.sources.length > 0 && (
-                      <div className="sources-list">
-                        <p className="sources-heading">Web sources</p>
-                        <ul>
-                          {message.sources.map((source) => (
-                            <li key={source.url}>
+                    <div className="message-body">
+                      <div className="message-text">{message.content}</div>
+
+                      {message.role === "assistant" &&
+                        message.sources &&
+                        message.sources.length > 0 && (
+                          <div className="source-list">
+                            <span className="source-label">Sources</span>
+                            {message.sources.map((source) => (
                               <a
+                                key={source.url}
+                                className="source-chip"
                                 href={source.url}
                                 target="_blank"
                                 rel="noopener noreferrer"
+                                title={source.title}
                               >
-                                {source.title}
+                                <span className="source-host">
+                                  {getHostname(source.url)}
+                                </span>
+                                <span className="source-title">
+                                  {source.title}
+                                </span>
                               </a>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                </div>
-              </article>
-            ))}
+                            ))}
+                          </div>
+                        )}
 
-            {voiceState === "processing" && (
-              <div className="thinking" role="status">
-                <span className="thinking-dots">
-                  <span />
-                  <span />
-                  <span />
-                </span>
-                <span>Thinking of a response...</span>
+                      {message.role === "assistant" && (
+                        <div className="message-actions">
+                          <button
+                            type="button"
+                            className="action-button"
+                            onClick={() =>
+                              void handleCopy(message.content, index)
+                            }
+                            aria-label="Copy message"
+                            title="Copy"
+                          >
+                            {copiedIndex === index ? (
+                              <CheckIcon size={15} />
+                            ) : (
+                              <CopyIcon size={15} />
+                            )}
+                          </button>
+
+                          <button
+                            type="button"
+                            className={`action-button ${
+                              voiceState === "speaking" &&
+                              speakingIndex === index
+                                ? "active"
+                                : ""
+                            }`}
+                            onClick={() =>
+                              handleReadAloud(message.content, index)
+                            }
+                            disabled={isListening}
+                            aria-label={
+                              voiceState === "speaking" &&
+                              speakingIndex === index
+                                ? "Stop reading aloud"
+                                : "Read aloud"
+                            }
+                            title={
+                              voiceState === "speaking" &&
+                              speakingIndex === index
+                                ? "Stop"
+                                : "Read aloud"
+                            }
+                          >
+                            {voiceState === "speaking" &&
+                            speakingIndex === index ? (
+                              <StopIcon size={15} />
+                            ) : (
+                              <SpeakerIcon size={15} />
+                            )}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </article>
+                ))}
+
+                {isProcessing && (
+                  <article className="message assistant" role="status">
+                    <span className="message-avatar">
+                      <SparkIcon size={16} />
+                    </span>
+                    <div className="message-body">
+                      <span className="typing-dots" aria-label="Thinking">
+                        <span />
+                        <span />
+                        <span />
+                      </span>
+                    </div>
+                  </article>
+                )}
               </div>
             )}
+
+            <div ref={messagesEndRef} />
           </div>
         </section>
 
-        {error && (
-          <div className="error-message" role="alert">
-            <span>{error}</span>
-            <button
-              type="button"
-              onClick={() => setError("")}
-              aria-label="Dismiss error"
+        <footer className="composer-area">
+          <div className="composer-inner">
+            {error && (
+              <div className="error-banner" role="alert">
+                <span>{error}</span>
+                <button
+                  type="button"
+                  onClick={() => setError("")}
+                  aria-label="Dismiss error"
+                >
+                  <CloseIcon size={16} />
+                </button>
+              </div>
+            )}
+
+            <div className="composer-toolbar">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={autoSpeak}
+                className={`voice-toggle ${autoSpeak ? "on" : ""}`}
+                onClick={handleAutoSpeakToggle}
+              >
+                {autoSpeak ? (
+                  <SpeakerIcon size={16} />
+                ) : (
+                  <SpeakerOffIcon size={16} />
+                )}
+                <span>Voice replies</span>
+                <span className="switch-track" aria-hidden="true">
+                  <span className="switch-thumb" />
+                </span>
+              </button>
+
+              <div className="toolbar-status" role="status">
+                {isListening && (
+                  <span className="live-status listening">
+                    <span className="pulse-dot" />
+                    Listening…
+                  </span>
+                )}
+
+                {voiceState === "speaking" && (
+                  <>
+                    <span className="live-status speaking">
+                      <span className="voice-wave" aria-hidden="true">
+                        <i />
+                        <i />
+                        <i />
+                        <i />
+                      </span>
+                      Speaking
+                    </span>
+                    <button
+                      type="button"
+                      className="stop-voice-button"
+                      onClick={stopSpeaking}
+                    >
+                      <StopIcon size={13} />
+                      Stop
+                    </button>
+                  </>
+                )}
+
+                {!voiceSupported &&
+                  !isListening &&
+                  voiceState !== "speaking" && (
+                    <span className="toolbar-hint">
+                      Voice input works in Chrome or Edge
+                    </span>
+                  )}
+              </div>
+            </div>
+
+            <form
+              className={`composer ${isListening ? "listening" : ""}`}
+              onSubmit={handleSubmit}
             >
-              ×
-            </button>
+              <textarea
+                ref={textareaRef}
+                rows={1}
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                onKeyDown={handleComposerKeyDown}
+                placeholder={
+                  isListening ? "Listening… speak now" : "Message My AI Voice"
+                }
+                aria-label="Your message"
+                maxLength={4000}
+              />
+
+              <div className="composer-actions">
+                <span className="composer-hint">
+                  <kbd>Enter</kbd> to send · <kbd>Shift</kbd> +{" "}
+                  <kbd>Enter</kbd> for a new line
+                </span>
+
+                <button
+                  type="button"
+                  className={`mic-button ${isListening ? "active" : ""}`}
+                  onClick={handleMicrophoneClick}
+                  disabled={isProcessing}
+                  aria-label={
+                    isListening ? "Stop listening" : "Start voice input"
+                  }
+                  title={isListening ? "Stop listening" : "Voice input"}
+                >
+                  {isListening ? <StopIcon size={16} /> : <MicIcon />}
+                </button>
+
+                <button
+                  type="submit"
+                  className="send-button"
+                  disabled={!input.trim() || isProcessing}
+                  aria-label="Send message"
+                  title="Send"
+                >
+                  <SendIcon />
+                </button>
+              </div>
+            </form>
+
+            <p className="composer-note">
+              My AI Voice can make mistakes. Check important information.
+            </p>
           </div>
-        )}
-
-        <div className="composer-area">
-          {voiceState === "listening" && (
-            <div className="listening-indicator" role="status">
-              <span className="listening-pulse" />
-              Listening to your voice
-            </div>
-          )}
-
-          {voiceState === "speaking" && (
-            <div className="speaking-indicator" role="status">
-              <span className="sound-wave" aria-hidden="true">
-                <i />
-                <i />
-                <i />
-                <i />
-                <i />
-              </span>
-              Assistant is speaking. Tap the microphone to interrupt.
-            </div>
-          )}
-
-          <form className="composer" onSubmit={handleSubmit}>
-            <button
-              type="button"
-              className={`mic-button ${
-                voiceState === "listening" ? "active" : ""
-              }`}
-              onClick={handleMicrophoneClick}
-              disabled={voiceState === "processing"}
-              aria-label={
-                voiceState === "listening"
-                  ? "Stop listening"
-                  : "Start voice input"
-              }
-              title={
-                voiceState === "listening"
-                  ? "Stop listening"
-                  : "Start voice input"
-              }
-            >
-              {voiceState === "listening" ? "■" : "🎙"}
-            </button>
-
-            <input
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              placeholder={
-                voiceState === "listening"
-                  ? "Speak now, or type here..."
-                  : "Ask me anything..."
-              }
-              aria-label="Your message"
-              maxLength={4000}
-              disabled={voiceState === "processing"}
-            />
-
-            <button
-              type="submit"
-              className="send-button"
-              disabled={!input.trim() || voiceState === "processing"}
-            >
-              Send <span aria-hidden="true">↑</span>
-            </button>
-          </form>
-
-          <p className="composer-note">
-            AI can make mistakes. Check important information.
-          </p>
-        </div>
-      </section>
-    </main>
+        </footer>
+      </main>
+    </div>
   );
 }

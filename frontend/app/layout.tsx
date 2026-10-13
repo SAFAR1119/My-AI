@@ -3,7 +3,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "MyVoice AI",
+  title: "My AI Voice",
   description: "Your personal AI voice and text assistant.",
 };
 
