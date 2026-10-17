@@ -28,6 +28,7 @@ type ChatSession = {
   title: string;
   messages: Message[];
   updatedAt: number;
+  isCustomTitle?: boolean;
 };
 
 type SpeechRecognitionResultLike = {
@@ -94,6 +95,8 @@ function isChatSession(value: unknown): value is ChatSession {
     typeof candidate.id !== "string" ||
     typeof candidate.title !== "string" ||
     typeof candidate.updatedAt !== "number" ||
+    (candidate.isCustomTitle !== undefined &&
+      typeof candidate.isCustomTitle !== "boolean") ||
     !Array.isArray(candidate.messages)
   ) {
     return false;
@@ -237,7 +240,14 @@ const MicIcon = (props: IconProps) => (
 
 const StopIcon = (props: IconProps) => (
   <Icon {...props}>
-    <rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor" />
+    <rect
+      x="6.5"
+      y="6.5"
+      width="11"
+      height="11"
+      rx="2"
+      fill="currentColor"
+    />
   </Icon>
 );
 
@@ -286,6 +296,22 @@ const ChatIcon = (props: IconProps) => (
   </Icon>
 );
 
+const RenameIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M12 20h9" />
+    <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4z" />
+  </Icon>
+);
+
+const DeleteIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M3 6h18" />
+    <path d="M8 6V4h8v2" />
+    <path d="M19 6l-1 14H6L5 6" />
+    <path d="M10 11v5M14 11v5" />
+  </Icon>
+);
+
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([initialMessage]);
   const [input, setInput] = useState("");
@@ -304,7 +330,6 @@ export default function Home() {
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
-
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceStateRef = useRef<VoiceState>("idle");
   const messagesRef = useRef<Message[]>([initialMessage]);
@@ -329,6 +354,8 @@ export default function Home() {
     if (voiceStateRef.current === "speaking") {
       changeVoiceState("idle");
     }
+
+    setSpeakingIndex(null);
   }, [changeVoiceState]);
 
   const speak = useCallback(
@@ -339,6 +366,7 @@ export default function Home() {
         !("speechSynthesis" in window)
       ) {
         changeVoiceState("idle");
+        setSpeakingIndex(null);
         return;
       }
 
@@ -346,6 +374,7 @@ export default function Home() {
 
       if (!cleanText) {
         changeVoiceState("idle");
+        setSpeakingIndex(null);
         return;
       }
 
@@ -371,6 +400,7 @@ export default function Home() {
           voiceStateRef.current === "speaking"
         ) {
           changeVoiceState("idle");
+          setSpeakingIndex(null);
         }
       };
 
@@ -380,6 +410,7 @@ export default function Home() {
           voiceStateRef.current === "speaking"
         ) {
           changeVoiceState("idle");
+          setSpeakingIndex(null);
         }
       };
 
@@ -440,7 +471,6 @@ export default function Home() {
 
     messagesRef.current = active.messages;
     setMessages(active.messages);
-
     setStorageLoaded(true);
 
     const browserWindow = window as SpeechWindow;
@@ -487,12 +517,13 @@ export default function Home() {
 
       const updated: ChatSession = {
         ...active,
-        title: getChatTitle(messages),
+        title: active.isCustomTitle
+          ? active.title
+          : getChatTitle(messages),
         messages,
         updatedAt: Date.now(),
       };
 
-      // Show the most recently active conversation first.
       return [
         updated,
         ...current.filter((session) => session.id !== activeChatId),
@@ -527,18 +558,20 @@ export default function Home() {
     activeChatIdRef.current = session.id;
     messagesRef.current = session.messages;
 
-    setChatSessions((current) => [
-      session,
-      ...current.filter((item) => item.id !== session.id),
-    ].slice(0, MAX_CHATS));
+    setChatSessions((current) =>
+      [session, ...current.filter((item) => item.id !== session.id)].slice(
+        0,
+        MAX_CHATS,
+      ),
+    );
 
     setActiveChatId(session.id);
     setMessages(session.messages);
-
     setInput("");
     setError("");
     setMode(null);
     changeVoiceState("idle");
+    setSpeakingIndex(null);
   }, [
     stopListening,
     stopSpeaking,
@@ -562,11 +595,11 @@ export default function Home() {
 
       setActiveChatId(session.id);
       setMessages(session.messages);
-
       setInput("");
       setError("");
       setMode(null);
       changeVoiceState("idle");
+      setSpeakingIndex(null);
       setSidebarOpen(false);
     },
     [
@@ -576,6 +609,115 @@ export default function Home() {
       changeVoiceState,
     ],
   );
+
+  const renameConversation = useCallback((session: ChatSession) => {
+    const proposedTitle = window.prompt(
+      "Enter a new title for this conversation:",
+      session.title,
+    );
+
+    if (proposedTitle === null) return;
+
+    const title = proposedTitle.replace(/\s+/g, " ").trim();
+
+    if (!title) {
+      setError("Conversation title cannot be empty.");
+      return;
+    }
+
+    setChatSessions((current) =>
+      current.map((item) =>
+        item.id === session.id
+          ? {
+              ...item,
+              title: title.slice(0, 80),
+              isCustomTitle: true,
+            }
+          : item,
+      ),
+    );
+  }, []);
+
+  const deleteConversation = useCallback(
+    (session: ChatSession) => {
+      const confirmed = window.confirm(
+        `Delete "${session.title}"? This conversation will be removed from this browser.`,
+      );
+
+      if (!confirmed) return;
+
+      const remaining = chatSessions.filter(
+        (item) => item.id !== session.id,
+      );
+
+      const deletingActive = session.id === activeChatIdRef.current;
+
+      if (!deletingActive) {
+        setChatSessions(remaining);
+        return;
+      }
+
+      stopListening();
+      stopSpeaking();
+      cancelPendingRequest();
+
+      const nextSession = remaining[0] ?? createChatSession();
+      const nextSessions =
+        remaining.length > 0 ? remaining : [nextSession];
+
+      activeChatIdRef.current = nextSession.id;
+      messagesRef.current = nextSession.messages;
+
+      setChatSessions(nextSessions);
+      setActiveChatId(nextSession.id);
+      setMessages(nextSession.messages);
+      setInput("");
+      setError("");
+      setMode(null);
+      changeVoiceState("idle");
+      setSpeakingIndex(null);
+      setSidebarOpen(false);
+    },
+    [
+      chatSessions,
+      stopListening,
+      stopSpeaking,
+      cancelPendingRequest,
+      changeVoiceState,
+    ],
+  );
+
+  const clearAllHistory = useCallback(() => {
+    const confirmed = window.confirm(
+      "Clear all saved conversations? This cannot be undone.",
+    );
+
+    if (!confirmed) return;
+
+    stopListening();
+    stopSpeaking();
+    cancelPendingRequest();
+
+    const freshSession = createChatSession();
+
+    activeChatIdRef.current = freshSession.id;
+    messagesRef.current = freshSession.messages;
+
+    setChatSessions([freshSession]);
+    setActiveChatId(freshSession.id);
+    setMessages(freshSession.messages);
+    setInput("");
+    setError("");
+    setMode(null);
+    changeVoiceState("idle");
+    setSpeakingIndex(null);
+    setSidebarOpen(false);
+  }, [
+    stopListening,
+    stopSpeaking,
+    cancelPendingRequest,
+    changeVoiceState,
+  ]);
 
   const startListening = useCallback(() => {
     if (typeof window === "undefined") return;
@@ -698,7 +840,6 @@ export default function Home() {
 
       messagesRef.current = nextMessages;
       setMessages(nextMessages);
-
       setInput("");
       changeVoiceState("processing");
 
@@ -712,12 +853,10 @@ export default function Home() {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            messages: nextMessages.slice(-30).map(
-              ({ role, content }) => ({
-                role,
-                content,
-              }),
-            ),
+            messages: nextMessages.slice(-30).map(({ role, content }) => ({
+              role,
+              content,
+            })),
           }),
           signal: controller.signal,
         });
@@ -802,7 +941,6 @@ export default function Home() {
     ],
   );
 
-
   // Grow the message box with its content, up to a comfortable limit.
   useEffect(() => {
     const textarea = textareaRef.current;
@@ -860,6 +998,7 @@ export default function Home() {
     try {
       await navigator.clipboard.writeText(text);
       setCopiedIndex(index);
+
       window.setTimeout(() => {
         setCopiedIndex((current) => (current === index ? null : current));
       }, 1600);
@@ -951,11 +1090,23 @@ export default function Home() {
         </div>
 
         <nav className="history-nav" aria-label="Recent conversations">
-          <p className="sidebar-label">Recent</p>
+          <div className="history-heading">
+            <p className="sidebar-label">Recent</p>
+
+            <button
+              type="button"
+              className="clear-history-button"
+              onClick={clearAllHistory}
+              disabled={chatSessions.length === 0}
+              title="Clear all conversation history"
+            >
+              Clear all
+            </button>
+          </div>
 
           <ul className="history-list">
             {chatSessions.map((session) => (
-              <li key={session.id}>
+              <li key={session.id} className="history-list-row">
                 <button
                   type="button"
                   className={`history-item ${
@@ -973,6 +1124,28 @@ export default function Home() {
                     {formatChatDate(session.updatedAt)}
                   </span>
                 </button>
+
+                <div className="history-item-actions">
+                  <button
+                    type="button"
+                    className="history-action-button"
+                    onClick={() => renameConversation(session)}
+                    aria-label={`Rename ${session.title}`}
+                    title="Rename conversation"
+                  >
+                    <RenameIcon size={14} />
+                  </button>
+
+                  <button
+                    type="button"
+                    className="history-action-button delete"
+                    onClick={() => deleteConversation(session)}
+                    aria-label={`Delete ${session.title}`}
+                    title="Delete conversation"
+                  >
+                    <DeleteIcon size={14} />
+                  </button>
+                </div>
               </li>
             ))}
           </ul>
@@ -985,6 +1158,7 @@ export default function Home() {
             }`}
             aria-hidden="true"
           />
+
           <div>
             <strong>
               {mode === "ai" ? "Groq AI connected" : "Personal assistant"}
@@ -1036,7 +1210,9 @@ export default function Home() {
                 <span className="welcome-logo">
                   <SparkIcon size={28} />
                 </span>
+
                 <h2>How can I help you today?</h2>
+
                 <p>
                   Type a message or tap the microphone to talk. Turn on
                   voice replies to hear the answers out loud.
@@ -1078,6 +1254,7 @@ export default function Home() {
                         message.sources.length > 0 && (
                           <div className="source-list">
                             <span className="source-label">Sources</span>
+
                             {message.sources.map((source) => (
                               <a
                                 key={source.url}
@@ -1159,6 +1336,7 @@ export default function Home() {
                     <span className="message-avatar">
                       <SparkIcon size={16} />
                     </span>
+
                     <div className="message-body">
                       <span className="typing-dots" aria-label="Thinking">
                         <span />
@@ -1180,6 +1358,7 @@ export default function Home() {
             {error && (
               <div className="error-banner" role="alert">
                 <span>{error}</span>
+
                 <button
                   type="button"
                   onClick={() => setError("")}
@@ -1203,7 +1382,9 @@ export default function Home() {
                 ) : (
                   <SpeakerOffIcon size={16} />
                 )}
+
                 <span>Voice replies</span>
+
                 <span className="switch-track" aria-hidden="true">
                   <span className="switch-thumb" />
                 </span>
@@ -1228,6 +1409,7 @@ export default function Home() {
                       </span>
                       Speaking
                     </span>
+
                     <button
                       type="button"
                       className="stop-voice-button"

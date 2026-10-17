@@ -1136,3 +1136,120 @@ button:disabled {
     scroll-behavior: auto !important;
   }
 }
+
+
+/* Conversation management actions */
+
+.sidebar-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.clear-history-button {
+  padding: 5px 7px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 10px;
+  opacity: 0.65;
+  cursor: pointer;
+}
+
+.clear-history-button:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.1);
+  color: #ef4444;
+  opacity: 1;
+}
+
+.clear-history-button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.chat-session-item {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.chat-session-item:hover {
+  background: rgba(128, 128, 128, 0.08);
+}
+
+.chat-session-item.active {
+  border-color: var(--border-color, rgba(128, 128, 128, 0.2));
+  background: rgba(128, 128, 128, 0.12);
+}
+
+.chat-session-item .chat-session-button {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+  border-color: transparent;
+  background: transparent;
+}
+
+.chat-session-item .chat-session-button:hover {
+  background: transparent;
+}
+
+.chat-session-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  padding: 0 5px 0 0;
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+
+.chat-session-item:hover .chat-session-actions,
+.chat-session-item:focus-within .chat-session-actions {
+  opacity: 1;
+}
+
+.chat-action-button {
+  display: grid;
+  place-items: center;
+  width: 27px;
+  height: 27px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: inherit;
+  font-size: 15px;
+  cursor: pointer;
+}
+
+.chat-action-button:hover {
+  background: rgba(128, 128, 128, 0.16);
+}
+
+.chat-action-button.delete:hover {
+  background: rgba(239, 68, 68, 0.12);
+  color: #ef4444;
+}
+
+@media (max-width: 700px) {
+  .chat-session-actions {
+    opacity: 1;
+  }
+
+  .chat-action-button {
+    width: 30px;
+    height: 30px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-session-item,
+  .chat-session-actions {
+    transition: none;
+  }
+}
+
