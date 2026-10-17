@@ -1253,3 +1253,174 @@ button:disabled {
   }
 }
 
+
+/* Conversation search and export */
+
+.history-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.clear-history-button {
+  padding: 5px 7px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 10px;
+  opacity: 0.65;
+  cursor: pointer;
+}
+
+.clear-history-button:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.1);
+  color: #ef4444;
+  opacity: 1;
+}
+
+.clear-history-button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.history-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin: 8px 0 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--border-color, rgba(128, 128, 128, 0.2));
+  border-radius: 9px;
+  background: rgba(128, 128, 128, 0.045);
+  color: inherit;
+}
+
+.history-search:focus-within {
+  border-color: var(--accent, #7c5cff);
+}
+
+.history-search > svg {
+  flex: 0 0 auto;
+  opacity: 0.6;
+}
+
+.history-search input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+}
+
+.history-search input::placeholder {
+  opacity: 0.55;
+}
+
+.history-search input::-webkit-search-cancel-button {
+  cursor: pointer;
+}
+
+.history-search > button {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.history-search > button:hover {
+  background: rgba(128, 128, 128, 0.15);
+}
+
+.history-list-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.history-list-row:hover {
+  background: rgba(128, 128, 128, 0.07);
+}
+
+.history-list-row .history-item {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
+}
+
+.history-item-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  padding: 0 5px 0 0;
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+
+.history-list-row:hover .history-item-actions,
+.history-list-row:focus-within .history-item-actions {
+  opacity: 1;
+}
+
+.history-action-button {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.history-action-button:hover {
+  background: rgba(128, 128, 128, 0.15);
+}
+
+.history-action-button.delete:hover {
+  background: rgba(239, 68, 68, 0.12);
+  color: #ef4444;
+}
+
+.history-empty {
+  margin: 12px 2px;
+  color: var(--muted, #888);
+  font-size: 11px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 700px) {
+  .history-item-actions {
+    opacity: 1;
+  }
+
+  .history-action-button {
+    width: 30px;
+    height: 30px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .history-list-row,
+  .history-item-actions {
+    transition: none;
+  }
+}
+

@@ -165,6 +165,52 @@ function getHostname(url: string): string {
   }
 }
 
+function createExportFilename(title: string): string {
+  const safeName = title
+    .normalize("NFKD")
+    .replace(/[^\w\s-]/g, "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .slice(0, 60);
+
+  return `${safeName || "my-ai-voice-chat"}.md`;
+}
+
+function createMarkdownExport(session: ChatSession): string {
+  const lines = [
+    `# ${session.title}`,
+    "",
+    `Exported from My AI Voice on ${new Date().toLocaleString()}`,
+    "Developed by Safar Ahmed",
+    "",
+    "---",
+    "",
+  ];
+
+  for (const message of session.messages) {
+    lines.push(
+      message.role === "user" ? "## You" : "## My AI Voice",
+      "",
+      message.content,
+      "",
+    );
+
+    if (message.sources && message.sources.length > 0) {
+      lines.push("**Sources**", "");
+
+      for (const source of message.sources) {
+        lines.push(`- [${source.title}](${source.url})`);
+      }
+
+      lines.push("");
+    }
+
+    lines.push("---", "");
+  }
+
+  return `${lines.join("\n").trim()}\n`;
+}
+
 const SUGGESTIONS = [
   {
     title: "Explain a concept",
@@ -312,6 +358,21 @@ const DeleteIcon = (props: IconProps) => (
   </Icon>
 );
 
+const SearchIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <circle cx="10.5" cy="10.5" r="6.5" />
+    <path d="m16 16 4 4" />
+  </Icon>
+);
+
+const DownloadIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M12 3v12" />
+    <path d="m7 10 5 5 5-5" />
+    <path d="M5 17v4h14v-4" />
+  </Icon>
+);
+
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([initialMessage]);
   const [input, setInput] = useState("");
@@ -327,6 +388,7 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [speakingIndex, setSpeakingIndex] = useState<number | null>(null);
+  const [historySearch, setHistorySearch] = useState("");
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -381,7 +443,6 @@ export default function Home() {
       window.speechSynthesis.cancel();
 
       const utterance = new SpeechSynthesisUtterance(cleanText);
-
       utterance.lang = "en-US";
       utterance.rate = 1;
       utterance.pitch = 1;
@@ -468,7 +529,6 @@ export default function Home() {
     setChatSessions(restoredSessions);
     setActiveChatId(active.id);
     activeChatIdRef.current = active.id;
-
     messagesRef.current = active.messages;
     setMessages(active.messages);
     setStorageLoaded(true);
@@ -484,7 +544,6 @@ export default function Home() {
 
     return () => {
       mountedRef.current = false;
-
       cancelPendingRequest();
 
       try {
@@ -499,12 +558,11 @@ export default function Home() {
     };
   }, [cancelPendingRequest]);
 
-  // Keep the current conversation synchronized with React state.
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
 
-  // Update the active chat's title, message list, and last activity time.
+  // Update the active conversation without overwriting a custom title.
   useEffect(() => {
     if (!storageLoaded || !activeChatId) return;
 
@@ -531,7 +589,7 @@ export default function Home() {
     });
   }, [messages, activeChatId, storageLoaded]);
 
-  // Save conversations to this browser after each change.
+  // Persist conversation data locally.
   useEffect(() => {
     if (!storageLoaded) return;
 
@@ -570,8 +628,8 @@ export default function Home() {
     setInput("");
     setError("");
     setMode(null);
-    changeVoiceState("idle");
     setSpeakingIndex(null);
+    changeVoiceState("idle");
   }, [
     stopListening,
     stopSpeaking,
@@ -598,8 +656,8 @@ export default function Home() {
       setInput("");
       setError("");
       setMode(null);
-      changeVoiceState("idle");
       setSpeakingIndex(null);
+      changeVoiceState("idle");
       setSidebarOpen(false);
     },
     [
@@ -650,9 +708,7 @@ export default function Home() {
         (item) => item.id !== session.id,
       );
 
-      const deletingActive = session.id === activeChatIdRef.current;
-
-      if (!deletingActive) {
+      if (session.id !== activeChatIdRef.current) {
         setChatSessions(remaining);
         return;
       }
@@ -674,8 +730,8 @@ export default function Home() {
       setInput("");
       setError("");
       setMode(null);
-      changeVoiceState("idle");
       setSpeakingIndex(null);
+      changeVoiceState("idle");
       setSidebarOpen(false);
     },
     [
@@ -709,8 +765,8 @@ export default function Home() {
     setInput("");
     setError("");
     setMode(null);
-    changeVoiceState("idle");
     setSpeakingIndex(null);
+    changeVoiceState("idle");
     setSidebarOpen(false);
   }, [
     stopListening,
@@ -718,6 +774,39 @@ export default function Home() {
     cancelPendingRequest,
     changeVoiceState,
   ]);
+
+  const exportConversation = useCallback(() => {
+    const session = chatSessions.find(
+      (item) => item.id === activeChatIdRef.current,
+    );
+
+    if (!session) {
+      setError("There is no conversation available to export.");
+      return;
+    }
+
+    try {
+      const markdown = createMarkdownExport(session);
+      const blob = new Blob([markdown], {
+        type: "text/markdown;charset=utf-8",
+      });
+
+      const downloadUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+
+      anchor.href = downloadUrl;
+      anchor.download = createExportFilename(session.title);
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+
+      window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+      setError("");
+    } catch (exportError) {
+      console.error("Could not export conversation:", exportError);
+      setError("Could not export this conversation.");
+    }
+  }, [chatSessions]);
 
   const startListening = useCallback(() => {
     if (typeof window === "undefined") return;
@@ -883,7 +972,6 @@ export default function Home() {
           throw new Error("The assistant returned an empty response.");
         }
 
-        // A late response must not appear in a different selected chat.
         if (activeChatIdRef.current !== sendChatId) {
           return;
         }
@@ -941,7 +1029,21 @@ export default function Home() {
     ],
   );
 
-  // Grow the message box with its content, up to a comfortable limit.
+  // Filter chats by title or message content.
+  const normalizedSearch = historySearch.trim().toLowerCase();
+
+  const visibleChatSessions = chatSessions.filter((session) => {
+    if (!normalizedSearch) return true;
+
+    return (
+      session.title.toLowerCase().includes(normalizedSearch) ||
+      session.messages.some((message) =>
+        message.content.toLowerCase().includes(normalizedSearch),
+      )
+    );
+  });
+
+  // Grow the composer textarea to fit its content.
   useEffect(() => {
     const textarea = textareaRef.current;
 
@@ -951,7 +1053,6 @@ export default function Home() {
     textarea.style.height = `${Math.min(textarea.scrollHeight, 220)}px`;
   }, [input]);
 
-  // Keep the newest message in view.
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({
       behavior: "smooth",
@@ -1028,10 +1129,11 @@ export default function Home() {
     (message) => message.role === "user",
   );
 
-  const activeTitle =
-    chatSessions.find((session) => session.id === activeChatId)?.title ??
-    "New conversation";
+  const activeSession = chatSessions.find(
+    (session) => session.id === activeChatId,
+  );
 
+  const activeTitle = activeSession?.title ?? "New conversation";
   const isProcessing = voiceState === "processing";
   const isListening = voiceState === "listening";
 
@@ -1104,8 +1206,30 @@ export default function Home() {
             </button>
           </div>
 
+          <label className="history-search">
+            <SearchIcon size={15} />
+            <input
+              type="search"
+              placeholder="Search chats and messages..."
+              value={historySearch}
+              onChange={(event) => setHistorySearch(event.target.value)}
+              aria-label="Search conversation history"
+            />
+
+            {historySearch && (
+              <button
+                type="button"
+                onClick={() => setHistorySearch("")}
+                aria-label="Clear search"
+                title="Clear search"
+              >
+                <CloseIcon size={13} />
+              </button>
+            )}
+          </label>
+
           <ul className="history-list">
-            {chatSessions.map((session) => (
+            {visibleChatSessions.map((session) => (
               <li key={session.id} className="history-list-row">
                 <button
                   type="button"
@@ -1149,6 +1273,12 @@ export default function Home() {
               </li>
             ))}
           </ul>
+
+          {visibleChatSessions.length === 0 && (
+            <p className="history-empty">
+              No conversations match “{historySearch}”.
+            </p>
+          )}
         </nav>
 
         <div className="sidebar-footer">
@@ -1186,6 +1316,17 @@ export default function Home() {
               <span className="state-dot" aria-hidden="true" />
               {statusText[voiceState]}
             </span>
+
+            <button
+              type="button"
+              className="icon-button"
+              onClick={exportConversation}
+              aria-label="Export current conversation"
+              title="Export conversation as Markdown"
+              disabled={!activeSession}
+            >
+              <DownloadIcon />
+            </button>
 
             <button
               type="button"
@@ -1375,7 +1516,12 @@ export default function Home() {
                 role="switch"
                 aria-checked={autoSpeak}
                 className={`voice-toggle ${autoSpeak ? "on" : ""}`}
-                onClick={handleAutoSpeakToggle}
+                onClick={() => {
+                  const enabled = !autoSpeak;
+                  setAutoSpeak(enabled);
+
+                  if (!enabled) stopSpeaking();
+                }}
               >
                 {autoSpeak ? (
                   <SpeakerIcon size={16} />
@@ -1433,14 +1579,26 @@ export default function Home() {
 
             <form
               className={`composer ${isListening ? "listening" : ""}`}
-              onSubmit={handleSubmit}
+              onSubmit={(event) => {
+                event.preventDefault();
+                void sendMessage();
+              }}
             >
               <textarea
                 ref={textareaRef}
                 rows={1}
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
-                onKeyDown={handleComposerKeyDown}
+                onKeyDown={(event) => {
+                  if (
+                    event.key === "Enter" &&
+                    !event.shiftKey &&
+                    !event.nativeEvent.isComposing
+                  ) {
+                    event.preventDefault();
+                    void sendMessage();
+                  }
+                }}
                 placeholder={
                   isListening ? "Listening… speak now" : "Message My AI Voice"
                 }
@@ -1457,7 +1615,13 @@ export default function Home() {
                 <button
                   type="button"
                   className={`mic-button ${isListening ? "active" : ""}`}
-                  onClick={handleMicrophoneClick}
+                  onClick={() => {
+                    if (isListening) {
+                      stopListening();
+                    } else {
+                      startListening();
+                    }
+                  }}
                   disabled={isProcessing}
                   aria-label={
                     isListening ? "Stop listening" : "Start voice input"
