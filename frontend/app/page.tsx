@@ -3,6 +3,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
+import MarkdownMessage from "./components/MarkdownMessage";
 
 type Source = {
   title: string;
